@@ -1,0 +1,13 @@
+# Generated output
+output.wav
+
+# Claude worktrees and settings
+.claude/
+
+# Environment
+.env
+
+# Python
+.venv/
+__pycache__/
+*.pyc

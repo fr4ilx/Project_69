@@ -75,6 +75,10 @@ GROK_MODEL    = "grok-3-mini"                          # or "grok-3" for the ful
 TTS_EXAGGERATION = 0.7
 TTS_CFG_WEIGHT   = 0.3
 
+# Speech rate: 1.0 = normal, < 1.0 = slower, > 1.0 = faster
+# Good starting points: 0.85 (slow), 0.90 (slightly slow), 1.0 (default)
+SPEECH_RATE = 0.80
+
 # Maximum characters per TTS chunk (Chatterbox works best below ~300 chars)
 CHUNK_MAX_CHARS = 280
 
@@ -98,7 +102,13 @@ def generate_story(prompt: str) -> str:
     system_msg = (
         "You are a master storyteller specialising in atmospheric, dramatic short fiction. "
         "Write vivid, evocative prose. Keep the story between 300 and 500 words. "
-        "Do not include a title or any meta-commentary — only the story itself."
+        "Do not include a title or any meta-commentary — only the story itself.\n\n"
+        "The story will be read aloud by a text-to-speech narrator. "
+        "Sprinkle in paralinguistic expression tags where they feel natural and enhance the drama. "
+        "Use them sparingly (2–5 times per story). "
+        "Supported tags (use exactly as written, including brackets): "
+        "[laugh] [chuckle] [sigh] [gasp] [cough] [sniff] [groan] [shush] [clear throat]\n"
+        "Example: 'She opened the door. [gasp] The room was empty.'"
     )
 
     print(f"\n[Grok] Generating story for prompt: '{prompt}' …")
@@ -227,6 +237,11 @@ def main() -> None:
 
     # --- Synthesise audio --------------------------------------------------
     wav = generate_audio(model, chunks)
+
+    # --- Adjust speed ------------------------------------------------------
+    if SPEECH_RATE != 1.0:
+        wav = ta.functional.resample(wav, int(model.sr * SPEECH_RATE), model.sr)
+        print(f"[Speed] Applied rate {SPEECH_RATE}x.")
 
     # --- Save output -------------------------------------------------------
     ta.save(OUTPUT_FILE, wav, model.sr)
