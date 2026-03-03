@@ -4,4 +4,13 @@ version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "fastapi>=0.135.1",
+    "openai>=2.24.0",
+    "python-dotenv>=1.2.2",
+    "sse-starlette>=3.3.2",
+    "uvicorn>=0.41.0",
+    "torch>=2.0.0",
+    "torchaudio>=2.0.0",
+    "chatterbox-tts>=0.1.0",
+]
