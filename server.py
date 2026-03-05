@@ -26,7 +26,7 @@ import torchaudio as ta
 # App lifecycle — load TTS model once at startup
 # ---------------------------------------------------------------------------
 
-_model: story_tts.ChatterboxTTS | None = None
+_model: story_tts.ChatterboxTurboTTS | None = None
 _lock = asyncio.Lock()
 
 
@@ -46,7 +46,7 @@ app = FastAPI(lifespan=lifespan)
 # SSE generation stream
 # ---------------------------------------------------------------------------
 
-async def _sse_generator(time_str: str, fantasy: str):
+async def _sse_generator(time_str: str, fantasy: str, voice_name: str = "alyssa"):
     """Async generator yielding SSE events for the full pipeline."""
     prompt = f"{fantasy}\n\nWrite for a {time_str} listening experience."
 
@@ -60,7 +60,11 @@ async def _sse_generator(time_str: str, fantasy: str):
             chunks = story_tts.chunk_text(story)
             n = len(chunks)
 
-            # 3. Synthesise chunk by chunk, yielding progress events
+            # 3. Set voice (pre-baked conds if available, else model uses its default)
+            if voice_name in story_tts.VOICES:
+                _model.conds = story_tts.VOICES[voice_name]  # type: ignore[union-attr]
+
+            # 4. Synthesise chunk by chunk, yielding progress events
             audio_parts: list[torch.Tensor] = []
             for i, chunk in enumerate(chunks, 1):
                 yield {"data": json.dumps({
@@ -71,13 +75,10 @@ async def _sse_generator(time_str: str, fantasy: str):
                 wav: torch.Tensor = await asyncio.to_thread(
                     _model.generate,  # type: ignore[union-attr]
                     chunk,
-                    audio_prompt_path=story_tts.AUDIO_PROMPT_PATH,
-                    exaggeration=story_tts.TTS_EXAGGERATION,
-                    cfg_weight=story_tts.TTS_CFG_WEIGHT,
                     temperature=story_tts.TTS_TEMPERATURE,
                     repetition_penalty=story_tts.TTS_REP_PENALTY,
-                    min_p=story_tts.TTS_MIN_P,
                     top_p=story_tts.TTS_TOP_P,
+                    top_k=story_tts.TTS_TOP_K,
                 )
 
                 if wav.dim() == 1:
@@ -107,11 +108,18 @@ async def _sse_generator(time_str: str, fantasy: str):
 class GenerateRequest(BaseModel):
     time: str
     fantasy: str
+    voice: str = "alyssa"
+
+
+@app.get("/api/voices")
+async def voices():
+    available = list(story_tts.VOICES.keys())
+    return {"voices": available if available else ["alyssa"]}
 
 
 @app.post("/api/generate")
 async def generate(req: GenerateRequest):
-    return EventSourceResponse(_sse_generator(req.time, req.fantasy))
+    return EventSourceResponse(_sse_generator(req.time, req.fantasy, req.voice))
 
 
 @app.get("/api/audio")

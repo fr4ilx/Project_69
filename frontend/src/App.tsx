@@ -1,14 +1,14 @@
-import { useState, useCallback, useRef } from "react";
+import { useState, useCallback, useRef, useEffect } from "react";
 import ChatWindow from "./components/ChatWindow";
 import QuickReplies from "./components/QuickReplies";
-import { streamGenerate } from "./api";
+import { streamGenerate, fetchVoices } from "./api";
 import landingBg from "./assets/landing-bg.png";
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
-type Stage = "landing" | "time" | "fantasy" | "generating" | "done";
+type Stage = "landing" | "time" | "fantasy" | "voice" | "generating" | "done";
 
 export interface Message {
   id: string;
@@ -80,8 +80,15 @@ export default function App() {
   const [stage, setStage] = useState<Stage>("landing");
   const [messages, setMessages] = useState<Message[]>([]);
   const [fantasy, setFantasy] = useState("");
+  const [availableVoices, setAvailableVoices] = useState<string[]>([]);
   const timeRef = useRef("");
+  const fantasyRef = useRef("");
+  const voiceRef = useRef("alyssa");
   const inputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    fetchVoices().then(setAvailableVoices);
+  }, []);
 
   const addMessage = useCallback((msg: Omit<Message, "id">): string => {
     const id = nextId();
@@ -114,14 +121,23 @@ export default function App() {
     [addMessage]
   );
 
-  // ── Stage: fantasy → generating ──────────────────────────
+  // ── Stage: fantasy → voice ────────────────────────────────
 
-  const handleFantasySubmit = useCallback(async () => {
+  const handleFantasySubmit = useCallback(() => {
     const f = fantasy.trim();
     if (!f) return;
-
+    fantasyRef.current = f;
     setFantasy("");
     addMessage({ type: "user-text", text: f });
+    addMessage({ type: "bot-text", text: "Which narrator would you like to use today?" });
+    setStage("voice");
+  }, [fantasy, addMessage]);
+
+  // ── Stage: voice → generating ─────────────────────────────
+
+  const handleVoiceSelect = useCallback(async (voice: string) => {
+    voiceRef.current = voice;
+    addMessage({ type: "user-text", text: voice });
     setStage("generating");
 
     const progressId = addMessage({
@@ -130,7 +146,7 @@ export default function App() {
     });
 
     try {
-      for await (const event of streamGenerate(timeRef.current, f)) {
+      for await (const event of streamGenerate(timeRef.current, fantasyRef.current, voiceRef.current)) {
         if (event.type === "story") {
           addMessage({ type: "bot-story", text: event.text });
         } else if (event.type === "progress") {
@@ -146,7 +162,7 @@ export default function App() {
     } catch (err) {
       updateMessage(progressId, `Error: ${String(err)}`);
     }
-  }, [fantasy, addMessage, updateMessage]);
+  }, [addMessage, updateMessage]);
 
   // ── Render ────────────────────────────────────────────────
 
@@ -210,6 +226,13 @@ export default function App() {
               </button>
             </div>
           </div>
+        )}
+
+        {stage === "voice" && (
+          <QuickReplies
+            options={availableVoices.length ? availableVoices.map((v) => v.charAt(0).toUpperCase() + v.slice(1)) : ["Alyssa"]}
+            onSelect={(v) => handleVoiceSelect(v.toLowerCase())}
+          />
         )}
 
         {stage === "generating" && (

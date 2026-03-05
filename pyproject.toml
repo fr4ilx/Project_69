@@ -3,7 +3,7 @@ name = "project-69"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.12,<3.13"
 dependencies = [
     "fastapi>=0.135.1",
     "openai>=2.24.0",
@@ -12,5 +12,15 @@ dependencies = [
     "uvicorn>=0.41.0",
     "torch>=2.0.0",
     "torchaudio>=2.0.0",
-    "chatterbox-tts>=0.1.0",
+    "chatterbox-tts @ git+https://github.com/resemble-ai/chatterbox.git",
+    "numpy>=1.26.0",
+    "ml-dtypes>=0.3.0",
+]
+
+[tool.uv.extra-build-dependencies]
+pkuseg = ["numpy"]
+
+[tool.uv]
+override-dependencies = [
+    "numpy>=1.26.0",
 ]

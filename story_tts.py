@@ -84,11 +84,11 @@ def _ensure_perth_watermarker() -> None:
 _ensure_perth_watermarker()
 
 try:
-    from chatterbox.tts import ChatterboxTTS
+    from chatterbox.tts_turbo import ChatterboxTurboTTS, Conditionals
 except ImportError:
     print("Installing chatterbox-tts …")
     pip_install("chatterbox-tts")
-    from chatterbox.tts import ChatterboxTTS
+    from chatterbox.tts_turbo import ChatterboxTurboTTS, Conditionals
 
 
 # ---------------------------------------------------------------------------
@@ -96,17 +96,25 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 # TTS generation settings — defaults (overridden by params.md if present)
-TTS_EXAGGERATION   = 0.5
-TTS_CFG_WEIGHT     = 0.5
+# Note: exaggeration, cfg_weight, and min_p are ignored by ChatterboxTurboTTS
+TTS_EXAGGERATION   = 0.0
+TTS_CFG_WEIGHT     = 0.0
 TTS_TEMPERATURE    = 0.8
 TTS_REP_PENALTY    = 1.2
-TTS_MIN_P          = 0.05
-TTS_TOP_P          = 1.0
+TTS_MIN_P          = 0.0
+TTS_TOP_P          = 0.95
+TTS_TOP_K          = 1000
 SPEECH_RATE        = 1.0
 CHUNK_MAX_CHARS    = 280
 
 # Voice clone: path to a clean 15–30 sec .wav file, or None for default voice
 AUDIO_PROMPT_PATH = "voice-1.wav"
+
+# Voices directory: contains <name>.wav and <name>_conds.pt files
+VOICES_DIR = "voices"
+
+# In-memory cache of pre-baked voice conditionals, populated by load_voices()
+VOICES: dict[str, Conditionals] = {}
 
 # Test mode: set to a .md file path to skip Grok and read story from file instead
 # e.g. "test_story.md" — set to None to use Grok normally
@@ -129,6 +137,7 @@ def _load_params(path: str = "params.md") -> None:
         "repetition_penalty":("TTS_REP_PENALTY",  float),
         "min_p":             ("TTS_MIN_P",          float),
         "top_p":             ("TTS_TOP_P",          float),
+        "top_k":             ("TTS_TOP_K",          int),
         "speech_rate":       ("SPEECH_RATE",       float),
         "chunk_max_chars":   ("CHUNK_MAX_CHARS",   int),
     }
@@ -241,50 +250,74 @@ def chunk_text(text: str, max_chars: int = CHUNK_MAX_CHARS) -> list[str]:
 # 5. Text-to-speech via Chatterbox
 # ---------------------------------------------------------------------------
 
-def load_tts_model() -> ChatterboxTTS:
-    """Load ChatterboxTTS, preferring CUDA > MPS > CPU."""
+def load_voices(model: ChatterboxTurboTTS) -> None:
+    """Load all *_conds.pt files from VOICES_DIR into the VOICES cache."""
+    import glob as _glob
+    pts = sorted(_glob.glob(f"{VOICES_DIR}/*_conds.pt"))
+    if not pts:
+        return
+    device = model.device
+    for pt in pts:
+        name = os.path.basename(pt).replace("_conds.pt", "")
+        conds = Conditionals.load(pt, map_location=device).to(device)
+        VOICES[name] = conds
+        print(f"[TTS] Loaded voice '{name}' from '{pt}'.")
+
+
+def load_tts_model() -> ChatterboxTurboTTS:
+    """Load ChatterboxTurboTTS, preferring CUDA > MPS > CPU, then load pre-baked voices."""
     if torch.cuda.is_available():
         device = "cuda"
     elif torch.backends.mps.is_available():
         device = "mps"
     else:
         device = "cpu"
-    print(f"[TTS] Loading ChatterboxTTS on device='{device}' …")
-    model = ChatterboxTTS.from_pretrained(device=device)
-    print("[TTS] Model loaded.\n")
+    print(f"[TTS] Loading ChatterboxTurboTTS on device='{device}' …")
+    model = ChatterboxTurboTTS.from_pretrained(device=device)
+    print("[TTS] Model loaded.")
+    load_voices(model)
+    print()
     return model
 
 
-def generate_audio(model: ChatterboxTTS, chunks: list[str]) -> torch.Tensor:
+def generate_audio(
+    model: ChatterboxTurboTTS,
+    chunks: list[str],
+    voice_name: str = "alyssa",
+) -> torch.Tensor:
     """
     Generate audio for every text chunk and concatenate them into one tensor.
     Returns a 2-D tensor shaped (channels, samples).
+
+    If voice_name is in VOICES, sets model.conds to the pre-baked embedding
+    (no audio_prompt_path needed). Falls back to live cloning via AUDIO_PROMPT_PATH.
     """
+    if voice_name in VOICES:
+        model.conds = VOICES[voice_name]
+        prompt_path = None
+        print(f"[TTS] Using pre-baked voice '{voice_name}'.")
+    else:
+        prompt_path = AUDIO_PROMPT_PATH
+        print(f"[TTS] Voice '{voice_name}' not found in cache; falling back to live cloning.")
+
     audio_parts: list[torch.Tensor] = []
     chunk_times: list[float] = []
-    clone_time: float = 0.0
 
     for i, chunk in enumerate(chunks, 1):
         print(f"[TTS] Synthesising chunk {i}/{len(chunks)}: '{chunk[:60]}…'")
         t0 = time.time()
         wav = model.generate(
             chunk,
-            audio_prompt_path=AUDIO_PROMPT_PATH,
-            exaggeration=TTS_EXAGGERATION,
-            cfg_weight=TTS_CFG_WEIGHT,
+            audio_prompt_path=prompt_path,
             temperature=TTS_TEMPERATURE,
             repetition_penalty=TTS_REP_PENALTY,
-            min_p=TTS_MIN_P,
             top_p=TTS_TOP_P,
+            top_k=TTS_TOP_K,
         )
         elapsed = time.time() - t0
-        # First chunk includes voice cloning; track it separately
-        if i == 1 and AUDIO_PROMPT_PATH:
-            clone_time = elapsed
-            print(f"         └─ clone + synthesis: {elapsed:.1f}s")
-        else:
-            chunk_times.append(elapsed)
-            print(f"         └─ synthesis: {elapsed:.1f}s")
+        chunk_times.append(elapsed)
+        suffix = " (+ live clone)" if i == 1 and prompt_path else ""
+        print(f"         └─ {elapsed:.1f}s{suffix}")
         # model.generate may return (1, T) or (T,); normalise to (1, T)
         if wav.dim() == 1:
             wav = wav.unsqueeze(0)
@@ -295,12 +328,9 @@ def generate_audio(model: ChatterboxTTS, chunks: list[str]) -> torch.Tensor:
 
     # --- Timing summary ----------------------------------------------------
     print("\n[Timing]")
-    if AUDIO_PROMPT_PATH:
-        print(f"  Voice cloning (chunk 1): {clone_time:.1f}s")
-    for i, t in enumerate(chunk_times, 2):
+    for i, t in enumerate(chunk_times, 1):
         print(f"  Chunk {i}: {t:.1f}s")
-    total = clone_time + sum(chunk_times)
-    print(f"  Total synthesis: {total:.1f}s\n")
+    print(f"  Total synthesis: {sum(chunk_times):.1f}s\n")
 
     return combined
 
