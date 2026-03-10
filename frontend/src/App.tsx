@@ -214,6 +214,7 @@ export default function App() {
     setIsEditing(true);
 
     addMessage({ type: "user-text", text: instruction });
+    addMessage({ type: "bot-text", text: "Let's recreate that story!" });
     const progressId = addMessage({ type: "bot-progress", text: "Rewriting story…" });
 
     // Prime AudioContext NOW while we're still in the user gesture call stack.
@@ -243,8 +244,9 @@ export default function App() {
     const fromChunk = chunkPlayerRef.current?.getCurrentChunkIndex() ?? undefined;
     const fromChunkIndex = fromChunk != null && fromChunk >= 0 ? fromChunk + 1 : undefined;
 
-    // Reset player — kept chunks will be re-streamed by the server
-    chunkPlayerRef.current?.reset();
+    // Soft reset: clear queue and stop sources but keep AudioContext alive so new chunks
+    // can play (creating a new context in the async loop would be blocked by autoplay policy).
+    chunkPlayerRef.current?.resetForEdit();
     setIsPlaying(false);
     isPlayingRef.current = false;
 

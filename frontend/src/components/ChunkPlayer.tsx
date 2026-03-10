@@ -8,6 +8,8 @@ export interface ChunkPlayerHandle {
   /** Returns the 0-based index of the chunk currently playing (or last played). */
   getCurrentChunkIndex(): number;
   reset(): void;
+  /** Clear queue and stop sources but keep AudioContext alive (for edit flow so new chunks can play). */
+  resetForEdit(): void;
   /** Stop and discard all sources from `fromIndex` onward, keeping earlier ones. */
   resetFromIndex(fromIndex: number): void;
 }
@@ -131,6 +133,23 @@ const ChunkPlayer = forwardRef<ChunkPlayerHandle>((_, ref) => {
       audioCtxRef.current = null;
       analyserRef.current = null;
       nextStartTimeRef.current = 0;
+    },
+
+    /** For edit: clear queue and stop sources but keep context so addChunk() can play without new user gesture. */
+    resetForEdit() {
+      for (const src of sourcesRef.current) {
+        try { src.stop(); } catch { /* already stopped */ }
+      }
+      sourcesRef.current = [];
+      queueRef.current = [];
+      processingRef.current = false;
+      currentChunkIndexRef.current = -1;
+      chunkStartTimesRef.current = [];
+      if (audioCtxRef.current) {
+        nextStartTimeRef.current = audioCtxRef.current.currentTime + 0.05;
+      } else {
+        nextStartTimeRef.current = 0;
+      }
     },
 
     resetFromIndex(fromIndex: number) {
