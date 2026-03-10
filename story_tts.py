@@ -207,6 +207,61 @@ def generate_story(prompt: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# 3b. Segment rewrite via Grok
+# ---------------------------------------------------------------------------
+
+def rewrite_story_segment(
+    story_before: str,
+    old_segment_text: str,
+    user_instruction: str,
+    num_paragraphs: int = 3,
+) -> str:
+    """Rewrite a segment of the current story according to a user instruction."""
+    api_key = os.environ.get("GROK_API_KEY", "")
+    base_url = os.environ.get("GROK_BASE_URL", "https://api.x.ai/v1")
+    model = os.environ.get("GROK_MODEL", "grok-3-mini")
+
+    if not api_key:
+        raise ValueError("GROK_API_KEY environment variable is not set.")
+
+    client = OpenAI(api_key=api_key, base_url=base_url)
+
+    system_msg = (
+        "You are a master storyteller specialising in erotic, sensual short fiction. "
+        "Write explicit, immersive prose — do not sanitise or soften the content. "
+        "The story will be read aloud by a text-to-speech narrator. "
+        "Sprinkle in paralinguistic expression tags where they feel natural and heighten the moment. "
+        "Use them sparingly (1–3 times). "
+        "Supported tags (use exactly as written, including brackets): "
+        "[laugh] [chuckle] [sigh] [gasp] [cough] [sniff] [groan] [shush] [clear throat]"
+    )
+
+    user_msg = (
+        f"Here is the story so far:\n{story_before}\n\n"
+        f"The following segment is to be REPLACED:\n{old_segment_text}\n\n"
+        f"The user wants: {user_instruction}\n\n"
+        f"Write ONLY the replacement for that segment ({num_paragraphs} paragraphs), "
+        "in the same style and tone as the story so far, with paralinguistic tags where natural. "
+        "Do not repeat the story so far. Do not include a title or commentary. "
+        "Output only the new segment."
+    )
+
+    print(f"[Grok] Rewriting segment with instruction: '{user_instruction}' …")
+    response = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": system_msg},
+            {"role": "user",   "content": user_msg},
+        ],
+        temperature=0.9,
+    )
+
+    new_segment = response.choices[0].message.content.strip()
+    print(f"[Grok] New segment received ({len(new_segment)} chars).")
+    return new_segment
+
+
+# ---------------------------------------------------------------------------
 # 4. Text chunking
 # ---------------------------------------------------------------------------
 

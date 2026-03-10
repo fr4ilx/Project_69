@@ -1,0 +1,32 @@
+# Dependencies and env
+.venv
+.env
+.env.*
+!.env.example
+
+# Git and IDE
+.git
+.gitignore
+.cursor
+*.md
+!params.md
+!README.md
+
+# Frontend (backend-only image)
+frontend/
+
+# Python
+__pycache__
+*.py[cod]
+*.egg-info
+.pytest_cache
+.mypy_cache
+
+# Artifacts and secrets
+output.wav
+*.wav
+!voices/
+voice-*.wav
+
+# Docs and deploy for other targets
+docs/

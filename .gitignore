@@ -1,5 +1,6 @@
 # Generated output
 output.wav
+output_chunks/
 
 # Claude worktrees and settings
 .claude/
@@ -11,3 +12,10 @@ output.wav
 .venv/
 __pycache__/
 *.pyc
+*.egg-info/
+
+# Node
+frontend/node_modules/
+
+# macOS
+.DS_Store
