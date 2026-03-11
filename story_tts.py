@@ -163,8 +163,13 @@ _load_params()
 # 3. Story generation via Grok
 # ---------------------------------------------------------------------------
 
-def generate_story(prompt: str) -> str:
-    """Call the Grok API and return the generated story as a string."""
+def generate_story(prompt: str, target_words: int = 900) -> str:
+    """Call the Grok API and return the generated story as a string.
+
+    target_words controls the length instruction sent to the LLM.
+    For very long stories (>2500 words) this is called in multiple segments
+    by generate_story_long(); call that instead for 30min/1hr experiences.
+    """
     api_key = os.environ.get("GROK_API_KEY", "")
     base_url = os.environ.get("GROK_BASE_URL", "https://api.x.ai/v1")
     model = os.environ.get("GROK_MODEL", "grok-3-mini")
@@ -177,21 +182,33 @@ def generate_story(prompt: str) -> str:
 
     client = OpenAI(api_key=api_key, base_url=base_url)
 
+    # Allow ~20% slack so the model doesn't cut off right at the limit
+    word_floor = int(target_words * 0.85)
+    word_ceil  = int(target_words * 1.15)
+    # max_tokens: ~1.3 tokens per word + headroom
+    max_tokens = int(target_words * 1.4) + 200
+
     system_msg = (
         "You are a master storyteller specialising in erotic, sensual short fiction. "
         "Write explicit, immersive prose — do not sanitise or soften the content. "
         "Honour exactly what is asked for, with full intensity and heat. "
-        "Keep the story between 300 and 500 words. "
+        f"Write between {word_floor} and {word_ceil} words — hitting this range is critical. "
         "Do not include a title or any meta-commentary — only the story itself.\n\n"
+        "PACING IS CRITICAL — follow this structure strictly:\n"
+        "- First ~1/3 of the word count: sensual buildup. Set the scene, build tension and desire.\n"
+        "- Next ~1/2 of the word count: the climax. Hard, intense, explicit action — this is the core of the story. Do NOT hold back.\n"
+        "- Final ~1/6 of the word count: the finish. Wind down, post-climax resolution.\n"
+        "Do NOT spend most of the story on atmosphere and setup. "
+        "Get into the action by the midpoint at the latest. The explicit scenes must be the longest part.\n\n"
         "The story will be read aloud by a text-to-speech narrator. "
         "Sprinkle in paralinguistic expression tags where they feel natural and heighten the moment. "
-        "Use them sparingly (2–5 times per story). "
+        "Use them sparingly (roughly one tag per 200 words). "
         "Supported tags (use exactly as written, including brackets): "
         "[laugh] [chuckle] [sigh] [gasp] [cough] [sniff] [groan] [shush] [clear throat]\n"
         "Example: 'She pulled him closer. [gasp] He didn\\'t resist.'"
     )
 
-    print(f"\n[Grok] Generating story for prompt: '{prompt}' …")
+    print(f"\n[Grok] Generating story (~{target_words} words) for prompt: '{prompt[:80]}' …")
     response = client.chat.completions.create(
         model=model,
         messages=[
@@ -199,15 +216,229 @@ def generate_story(prompt: str) -> str:
             {"role": "user",   "content": prompt},
         ],
         temperature=0.9,
+        max_tokens=max_tokens,
     )
 
     story = response.choices[0].message.content.strip()
-    print(f"[Grok] Story received ({len(story)} chars).\n")
+    print(f"[Grok] Story received ({len(story)} chars, ~{len(story.split())} words).\n")
     return story
 
 
+def generate_story_long(prompt: str, target_words: int) -> str:
+    """Generate a long story by stitching together multiple Grok segments.
+
+    Used when target_words > 2500 (i.e. 30-min and 1-hour selections).
+    Each segment is ~2000 words; subsequent segments continue the story.
+    """
+    api_key = os.environ.get("GROK_API_KEY", "")
+    base_url = os.environ.get("GROK_BASE_URL", "https://api.x.ai/v1")
+    model    = os.environ.get("GROK_MODEL", "grok-3-mini")
+    client   = OpenAI(api_key=api_key, base_url=base_url)
+
+    SEGMENT_WORDS = 2000
+    num_segments  = max(2, round(target_words / SEGMENT_WORDS))
+    seg_max_tokens = int(SEGMENT_WORDS * 1.4) + 200
+
+    tag_note = (
+        "Sprinkle in paralinguistic expression tags where they feel natural. "
+        "Use roughly one tag per 200 words. "
+        "Supported tags (exact brackets): "
+        "[laugh] [chuckle] [sigh] [gasp] [cough] [sniff] [groan] [shush] [clear throat]"
+    )
+
+    base_system = (
+        "You are a master storyteller specialising in erotic, sensual short fiction. "
+        "Write explicit, immersive prose — do not sanitise or soften the content. "
+        "Honour exactly what is asked for, with full intensity and heat. "
+        "Do not include a title or any meta-commentary — only the story itself.\n\n"
+        "PACING IS CRITICAL — the overall story must follow this structure:\n"
+        "- First ~1/3: sensual buildup. Set the scene, build tension and desire.\n"
+        "- Next ~1/2: the climax. Hard, intense, explicit action — this is the core. Do NOT hold back.\n"
+        "- Final ~1/6: the finish. Wind down, post-climax resolution.\n"
+        "Do NOT spend most of the story on atmosphere and setup. "
+        "The explicit scenes must be the longest part.\n\n"
+        "The story will be read aloud by a TTS narrator. " + tag_note
+    )
+
+    segments: list[str] = []
+    story_so_far = ""
+
+    for seg in range(1, num_segments + 1):
+        is_last = seg == num_segments
+        word_floor = int(SEGMENT_WORDS * 0.85)
+        word_ceil  = int(SEGMENT_WORDS * 1.15)
+
+        if seg == 1:
+            user_msg = (
+                f"{prompt}\n\n"
+                f"Write the OPENING of this story ({word_floor}–{word_ceil} words). "
+                f"This is part 1 of {num_segments}; do NOT conclude — leave the tension building."
+            )
+        elif is_last:
+            user_msg = (
+                f"Here is the story so far:\n\n{story_so_far}\n\n"
+                f"Continue and CONCLUDE the story ({word_floor}–{word_ceil} words). "
+                "Bring it to a satisfying, climactic end. Output only the new segment."
+            )
+        else:
+            user_msg = (
+                f"Here is the story so far:\n\n{story_so_far}\n\n"
+                f"Continue the story ({word_floor}–{word_ceil} words). "
+                f"This is part {seg} of {num_segments}; keep the tension rising, do NOT conclude yet. "
+                "Output only the new segment."
+            )
+
+        print(f"\n[Grok] Generating segment {seg}/{num_segments} (~{SEGMENT_WORDS} words) …")
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": base_system},
+                {"role": "user",   "content": user_msg},
+            ],
+            temperature=0.9,
+            max_tokens=seg_max_tokens,
+        )
+        segment_text = response.choices[0].message.content.strip()
+        print(f"[Grok] Segment {seg} received ({len(segment_text)} chars, ~{len(segment_text.split())} words).")
+        segments.append(segment_text)
+        # Give subsequent segments context from last ~500 words only (keep prompt short)
+        story_so_far = " ".join(" ".join(segments).split()[-500:])
+
+    full_story = "\n\n".join(segments)
+    print(f"\n[Grok] Full story: {len(full_story)} chars, ~{len(full_story.split())} words.\n")
+    return full_story
+
+
 # ---------------------------------------------------------------------------
-# 3b. Segment rewrite via Grok
+# 3b. Chunk-by-chunk generation via Grok
+# ---------------------------------------------------------------------------
+
+_ARC_DIRECTIVES: dict[str, str] = {
+    "setup": (
+        "Establish the scene, characters, and initial tension. "
+        "Be sensual and evocative but do not escalate sexually yet."
+    ),
+    "build": (
+        "Deepen the intimacy and physical tension. Escalate desire and sensation. "
+        "Do not bring things to climax yet — keep the tension rising."
+    ),
+    "peak": (
+        "Bring the scene to full sexual climax. Full intensity, raw and explicit. "
+        "This is the peak moment — hold nothing back."
+    ),
+    "finish": (
+        "Wind down from the climax. Post-orgasm afterglow, tender or breathless. "
+        "Bring the story to a satisfying close."
+    ),
+}
+
+
+def compute_arc_phase(para_index: int, n_paragraphs: int) -> str:
+    """Return the arc phase for a given paragraph index.
+
+    Split: ~1/3 setup, ~1/2 peak (climax), ~1/6 finish.
+    'build' is a single transitional paragraph between setup and peak.
+    """
+    setup_end = max(1, round(n_paragraphs * (1 / 3)))       # first ~1/3
+    finish_start = max(setup_end + 1, n_paragraphs - max(1, round(n_paragraphs * (1 / 6))))  # last ~1/6
+
+    if para_index < setup_end:
+        return "setup"
+    elif para_index == setup_end:
+        return "build"
+    elif para_index < finish_start:
+        return "peak"
+    else:
+        return "finish"
+
+
+def generate_next_chunk(
+    prompt: str,
+    story_so_far: str,
+    arc_phase: str = "setup",
+    is_first: bool = False,
+    is_last: bool = False,
+    words: int = 100,
+    event_hint: str | None = None,
+) -> str:
+    """Generate the next story paragraph using Grok, guided by arc phase.
+
+    Args:
+        prompt:       The original user story concept.
+        story_so_far: All previously generated text (from DB).
+        arc_phase:    Current narrative phase — 'setup', 'build', or 'peak'.
+        is_first:     True for the opening paragraph (no story_so_far yet).
+        is_last:      True for the final paragraph (conclude the scene).
+        words:        Target word count for this paragraph.
+        event_hint:   Optional user instruction to weave into this paragraph.
+    """
+    api_key = os.environ.get("GROK_API_KEY", "")
+    base_url = os.environ.get("GROK_BASE_URL", "https://api.x.ai/v1")
+    model = os.environ.get("GROK_MODEL", "grok-3-mini")
+    client = OpenAI(api_key=api_key, base_url=base_url)
+
+    directive = _ARC_DIRECTIVES.get(arc_phase, _ARC_DIRECTIVES["setup"])
+
+    system_msg = (
+        "You are a master storyteller specialising in erotic, sensual short fiction. "
+        "Write explicit, immersive prose — do not sanitise or soften the content. "
+        "The story will be read aloud by a TTS narrator. "
+        "Sprinkle in paralinguistic tags sparingly (0–1 per paragraph): "
+        "[laugh] [chuckle] [sigh] [gasp] [cough] [sniff] [groan] [shush] [clear throat]"
+    )
+
+    hint_line = ""
+    if event_hint:
+        hint_line = (
+            f"\nIMPORTANT — the listener has requested this happen in this paragraph: "
+            f"\"{event_hint}\". Weave it in naturally.\n"
+        )
+
+    if is_first:
+        user_msg = (
+            f"Story concept: {prompt}\n\n"
+            f"Write the OPENING paragraph of this story ({words} words). "
+            f"{directive} "
+            f"{hint_line}"
+            "Do not include a title. Output only the paragraph."
+        )
+    elif is_last:
+        user_msg = (
+            f"Story concept: {prompt}\n\n"
+            f"Story so far:\n{story_so_far}\n\n"
+            f"Write the FINAL paragraph ({words} words). "
+            f"{directive} "
+            f"{hint_line}"
+            "Output only the paragraph."
+        )
+    else:
+        user_msg = (
+            f"Story concept: {prompt}\n\n"
+            f"Story so far:\n{story_so_far}\n\n"
+            f"Write the next paragraph ({words} words). "
+            f"{directive} "
+            f"{hint_line}"
+            "Continue naturally. Do not repeat what was already written. "
+            "Output only the paragraph."
+        )
+
+    print(f"[Grok] Generating next chunk (phase={arc_phase}, first={is_first}, last={is_last}) …")
+    response = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": user_msg},
+        ],
+        temperature=0.9,
+        max_tokens=int(words * 1.5) + 50,
+    )
+    paragraph = response.choices[0].message.content.strip()
+    print(f"[Grok] Paragraph received ({len(paragraph)} chars, ~{len(paragraph.split())} words).")
+    return paragraph
+
+
+# ---------------------------------------------------------------------------
+# 3c. Segment rewrite via Grok
 # ---------------------------------------------------------------------------
 
 def rewrite_story_segment(

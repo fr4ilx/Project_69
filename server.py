@@ -25,6 +25,7 @@ from sse_starlette.sse import EventSourceResponse
 
 # Import story_tts first — it auto-installs torch/torchaudio if missing.
 import story_tts
+import db
 import torch
 import torchaudio as ta
 
@@ -35,6 +36,8 @@ import torchaudio as ta
 _model: story_tts.ChatterboxTurboTTS | None = None
 _lock = asyncio.Lock()
 _abort = asyncio.Event()  # set to signal current generation should stop
+_event_hint: str | None = None  # user-injected event for the next paragraph
+_redirect: str | None = None   # persistent course change for all remaining paragraphs
 
 CHUNKS_DIR = Path("output_chunks")
 
@@ -78,6 +81,7 @@ _audio_parts: list[torch.Tensor] = []  # raw (pre-speed) per-chunk tensors
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _model
+    db.init_db()
     print("[Server] Loading TTS model…")
     _model = await asyncio.to_thread(story_tts.load_tts_model)
     print("[Server] TTS model ready.")
@@ -91,91 +95,170 @@ app = FastAPI(lifespan=lifespan)
 # SSE generation stream
 # ---------------------------------------------------------------------------
 
-async def _sse_generator(time_str: str, fantasy: str, voice_name: str = "alyssa"):
-    """Async generator yielding SSE events for the full pipeline."""
-    prompt = f"{fantasy}\n\nWrite for a {time_str} listening experience."
+_TIME_TO_WORDS: dict[str, int] = {
+    "5 minutes":  950,
+    "15 minutes": 2800,
+    "30 minutes": 5500,
+    "an hour":    11000,
+}
+_LONG_STORY_THRESHOLD = 2500  # words; above this use multi-segment generation
 
-    _abort.clear()
+
+_WORDS_PER_GROK_CHUNK = 100  # target words per Grok paragraph
+
+
+async def _sse_generator(time_str: str, fantasy: str, voice_name: str = "alyssa"):
+    """Async generator yielding SSE events for the full pipeline.
+
+    Generates story paragraph by paragraph (chunk-by-chunk Grok calls),
+    synthesising each paragraph's TTS chunks immediately so playback starts fast.
+    Arc phase is read from the DB session each iteration — HR can update it live.
+    """
+    target_words = _TIME_TO_WORDS.get(time_str.lower(), 950)
+    prompt = fantasy
+    n_paragraphs = max(3, target_words // _WORDS_PER_GROK_CHUNK)
 
     async with _lock:
+        # Clear abort INSIDE the lock — if we clear before acquiring,
+        # the old generator may miss the abort signal (same race as _sse_editor).
+        _abort.clear()
+
+        global _redirect
+        _redirect = None  # clear any leftover redirect from a previous session
+
         try:
-            # 1. Generate story via Grok
             story_id = uuid.uuid4().hex
-            story = await asyncio.to_thread(story_tts.generate_story, prompt)
 
-            if _abort.is_set():
-                yield {"data": json.dumps({"type": "aborted"})}
-                return
-
-            yield {"data": json.dumps({"type": "story", "text": story, "story_id": story_id})}
-
-            # 2. Chunk the story
-            chunks = story_tts.chunk_text(story)
-            n = len(chunks)
-
-            # 3. Set voice
+            # 1. Set voice
             if voice_name in story_tts.VOICES:
                 _model.conds = story_tts.VOICES[voice_name]  # type: ignore[union-attr]
 
-            # 4. Create a fresh chunk directory for this session
+            # 2. Create fresh chunk directory and register session
             chunk_dir = CHUNKS_DIR / story_id
             if CHUNKS_DIR.exists():
-                shutil.rmtree(CHUNKS_DIR)  # drop previous session chunks
+                shutil.rmtree(CHUNKS_DIR)
             chunk_dir.mkdir(parents=True)
 
-            # 5. Register story in the store
-            record = _new_story_record(story_id, story, chunks, voice_name)
-            _stories[story_id] = record
+            db.create_session(story_id, prompt, voice_name)
+            _stories[story_id] = {
+                "story_id": story_id,
+                "story_text": "",
+                "voice": voice_name,
+                "status": "rendering",
+                "chunks": [],
+            }
+            record = _stories[story_id]
 
-            # 6. Synthesise chunk by chunk — save each, emit chunk events
+            yield {"data": json.dumps({"type": "session", "story_id": story_id})}
+
+            # 3. Generate paragraph by paragraph
             audio_parts: list[torch.Tensor] = []
-            for i, chunk in enumerate(chunks, 1):
-                # Check abort before each chunk
+            tts_index = 0  # global TTS chunk counter across all paragraphs
+
+            for para_i in range(n_paragraphs):
                 if _abort.is_set():
                     record["status"] = "aborted"
-                    yield {"data": json.dumps({"type": "aborted", "chunks_completed": i - 1})}
+                    yield {"data": json.dumps({"type": "aborted", "chunks_completed": tts_index})}
                     return
 
-                record["chunks"][i - 1]["status"] = "rendering"
+                is_first = para_i == 0
+                is_last = para_i == n_paragraphs - 1
+
+                # Auto-advance arc phase based on position in the story
+                arc_phase = story_tts.compute_arc_phase(para_i, n_paragraphs)
+                db.set_arc_phase(story_id, arc_phase)
+
                 yield {"data": json.dumps({
                     "type": "progress",
-                    "text": f"Synthesising chunk {i}/{n}…",
+                    "text": f"Writing paragraph {para_i + 1}/{n_paragraphs}…",
                 })}
 
-                wav: torch.Tensor = await asyncio.to_thread(
-                    _model.generate,  # type: ignore[union-attr]
-                    chunk,
-                    temperature=story_tts.TTS_TEMPERATURE,
-                    repetition_penalty=story_tts.TTS_REP_PENALTY,
-                    top_p=story_tts.TTS_TOP_P,
-                    top_k=story_tts.TTS_TOP_K,
+                # Consume any user-injected event hint (one-shot)
+                # and read persistent redirect (stays until new generation)
+                global _event_hint
+                hint = _event_hint
+                _event_hint = None
+                combined_hint = " ".join(filter(None, [_redirect, hint]))
+
+                story_so_far = db.get_story_so_far(story_id)
+                paragraph = await asyncio.to_thread(
+                    story_tts.generate_next_chunk,
+                    prompt,
+                    story_so_far,
+                    arc_phase,
+                    is_first,
+                    is_last,
+                    _WORDS_PER_GROK_CHUNK,
+                    combined_hint or None,
                 )
 
-                if wav.dim() == 1:
-                    wav = wav.unsqueeze(0)
+                if _abort.is_set():
+                    record["status"] = "aborted"
+                    yield {"data": json.dumps({"type": "aborted", "chunks_completed": tts_index})}
+                    return
 
-                # Apply speed per-chunk so streaming audio is correct rate
-                if story_tts.SPEECH_RATE != 1.0:
-                    wav = ta.functional.resample(
-                        wav,
-                        int(_model.sr * story_tts.SPEECH_RATE),  # type: ignore[union-attr]
-                        _model.sr,  # type: ignore[union-attr]
+                # Append paragraph to story text and emit update
+                record["story_text"] = (record["story_text"] + "\n\n" + paragraph).strip()
+                yield {"data": json.dumps({"type": "story", "text": record["story_text"], "story_id": story_id})}
+
+                # 4. Split paragraph into TTS-sized chunks and synthesise each
+                tts_chunks = story_tts.chunk_text(paragraph)
+                for tts_chunk in tts_chunks:
+                    if _abort.is_set():
+                        record["status"] = "aborted"
+                        yield {"data": json.dumps({"type": "aborted", "chunks_completed": tts_index})}
+                        return
+
+                    yield {"data": json.dumps({
+                        "type": "progress",
+                        "text": f"Synthesising chunk {tts_index + 1}…",
+                    })}
+
+                    wav: torch.Tensor = await asyncio.to_thread(
+                        _model.generate,  # type: ignore[union-attr]
+                        tts_chunk,
+                        temperature=story_tts.TTS_TEMPERATURE,
+                        repetition_penalty=story_tts.TTS_REP_PENALTY,
+                        top_p=story_tts.TTS_TOP_P,
+                        top_k=story_tts.TTS_TOP_K,
                     )
 
-                chunk_path = chunk_dir / f"chunk_{i:03d}.wav"
-                ta.save(str(chunk_path), wav, _model.sr)  # type: ignore[union-attr]
-                audio_parts.append(wav)
+                    # Check abort right after TTS returns (may have been
+                    # set while the blocking generate call was running)
+                    if _abort.is_set():
+                        record["status"] = "aborted"
+                        yield {"data": json.dumps({"type": "aborted", "chunks_completed": tts_index})}
+                        return
 
-                record["chunks"][i - 1]["status"] = "complete"
-                record["chunks"][i - 1]["audio_path"] = str(chunk_path)
+                    if wav.dim() == 1:
+                        wav = wav.unsqueeze(0)
+                    if story_tts.SPEECH_RATE != 1.0:
+                        wav = ta.functional.resample(
+                            wav,
+                            int(_model.sr * story_tts.SPEECH_RATE),  # type: ignore[union-attr]
+                            _model.sr,  # type: ignore[union-attr]
+                        )
 
-                yield {"data": json.dumps({
-                    "type": "chunk",
-                    "index": i - 1,
-                    "url": f"/api/chunks/{story_id}/chunk_{i:03d}.wav",
-                })}
+                    chunk_path = chunk_dir / f"chunk_{tts_index:03d}.wav"
+                    ta.save(str(chunk_path), wav, _model.sr)  # type: ignore[union-attr]
+                    audio_parts.append(wav)
 
-            # 7. Save combined output.wav (already speed-adjusted per chunk)
+                    record["chunks"].append({
+                        "index": tts_index,
+                        "text": tts_chunk,
+                        "status": "complete",
+                        "audio_path": str(chunk_path),
+                    })
+                    db.save_chunk(story_id, tts_index, tts_chunk, str(chunk_path))
+
+                    yield {"data": json.dumps({
+                        "type": "chunk",
+                        "index": tts_index,
+                        "url": f"/api/chunks/{story_id}/chunk_{tts_index:03d}.wav",
+                    })}
+                    tts_index += 1
+
+            # 5. Save combined output.wav
             combined = torch.cat(audio_parts, dim=-1)
             ta.save(story_tts.OUTPUT_FILE, combined, _model.sr)  # type: ignore[union-attr]
 
@@ -341,6 +424,10 @@ class EditRequest(BaseModel):
     from_chunk_index: int | None = None
 
 
+class InjectRequest(BaseModel):
+    event: str
+
+
 @app.get("/api/story/{story_id}")
 async def story_status(story_id: str):
     if not re.fullmatch(r"[a-f0-9]{32}", story_id):
@@ -367,6 +454,22 @@ async def abort():
     """Signal the current generation/edit to stop after the current chunk."""
     _abort.set()
     return {"ok": True}
+
+
+@app.post("/api/inject")
+async def inject(req: InjectRequest):
+    """Queue an event hint for the next generated paragraph."""
+    global _event_hint
+    _event_hint = req.event.strip() or None
+    return {"ok": True, "event": _event_hint}
+
+
+@app.post("/api/redirect")
+async def redirect(req: InjectRequest):
+    """Set a persistent course change for all remaining paragraphs."""
+    global _redirect
+    _redirect = req.event.strip() or None
+    return {"ok": True, "redirect": _redirect}
 
 
 @app.post("/api/edit")

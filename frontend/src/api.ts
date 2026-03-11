@@ -66,6 +66,28 @@ export async function abortGeneration(): Promise<void> {
   await fetch("/api/abort", { method: "POST" });
 }
 
+/**
+ * Queue an event hint to be woven into the next generated paragraph.
+ */
+export async function injectEvent(event: string): Promise<void> {
+  await fetch("/api/inject", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ event }),
+  });
+}
+
+/**
+ * Set a persistent course change for all remaining paragraphs.
+ */
+export async function redirectStory(event: string): Promise<void> {
+  await fetch("/api/redirect", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ event }),
+  });
+}
+
 export async function* streamGenerate(
   time: string,
   fantasy: string,

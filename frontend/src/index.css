@@ -219,6 +219,24 @@ body {
   accent-color: #f472b6;
 }
 
+.download-btn {
+  display: inline-block;
+  margin-top: 10px;
+  padding: 8px 18px;
+  background: #f472b6;
+  color: #0a0a0a;
+  border-radius: 8px;
+  font-weight: 600;
+  font-size: 0.85rem;
+  text-decoration: none;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.download-btn:hover {
+  background: #f9a8d4;
+}
+
 .story-panel-empty {
   flex: 1;
   display: flex;
@@ -344,6 +362,53 @@ body {
 
 .send-btn:hover {
   background: #ec4899;
+}
+
+.cancel-btn {
+  background: transparent;
+  border: 1px solid #333;
+  border-radius: 10px;
+  padding: 10px 14px;
+  color: #888;
+  font-size: 0.95rem;
+  cursor: pointer;
+  transition: color 0.15s;
+}
+
+.cancel-btn:hover {
+  color: #fff;
+}
+
+.action-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 4px 0;
+}
+
+.action-btn {
+  background: #1e1e1e;
+  border: 1px solid #333;
+  border-radius: 10px;
+  padding: 10px 18px;
+  color: #f472b6;
+  font-size: 0.88rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+
+.action-btn:hover {
+  background: #2a2a2a;
+  border-color: #f472b6;
+}
+
+.action-btn--stop {
+  color: #888;
+}
+
+.action-btn--stop:hover {
+  border-color: #888;
 }
 
 .status-bar {

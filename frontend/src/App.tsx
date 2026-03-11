@@ -4,7 +4,7 @@ import QuickReplies from "./components/QuickReplies";
 import AudioPlayer from "./components/AudioPlayer";
 import ChunkPlayer, { type ChunkPlayerHandle } from "./components/ChunkPlayer";
 import { VoicePoweredOrb } from "./components/VoicePoweredOrb";
-import { streamGenerate, streamEdit, abortGeneration, fetchVoices } from "./api";
+import { streamGenerate, abortGeneration, injectEvent, redirectStory, fetchVoices } from "./api";
 import landingBg from "./assets/landing-bg.png";
 
 // ---------------------------------------------------------------------------
@@ -86,6 +86,7 @@ export default function App() {
   const [availableVoices, setAvailableVoices] = useState<string[]>([]);
   const [editInstruction, setEditInstruction] = useState("");
   const [isEditing, setIsEditing] = useState(false);
+  const [actionMode, setActionMode] = useState<"none" | "inject" | "redirect" | "new_fantasy">("none");
   const [storyText, setStoryText] = useState<string | null>(null);
   const [storyId, setStoryId] = useState<string | null>(null);
   const [audioSrc, setAudioSrc] = useState<string | null>(null); // used for post-edit replay
@@ -187,6 +188,7 @@ export default function App() {
           }
         } else if (event.type === "done") {
           updateMessage(progressId, "Story complete.");
+          setAudioSrc(`/api/audio?t=${Date.now()}`);
           setStage("done");
         } else if (event.type === "aborted") {
           updateMessage(progressId, "Generation stopped — redirecting…");
@@ -202,56 +204,74 @@ export default function App() {
     }
   }, [addMessage, updateMessage]);
 
-  // ── Edit / redirect (works during generating OR done) ─────
+  // ── Action: Inject event into next paragraph ──────────────
 
-  const handleEdit = useCallback(async () => {
-    const instruction = editInstruction.trim();
-    if (!instruction || isEditing) return;
-    // During generation, storyId may not be set yet — that's OK, we'll
-    // abort and wait for it. But if we're in "done" stage we need it.
-    if (!storyId && stage === "done") return;
+  const handleInject = useCallback(async () => {
+    const text = editInstruction.trim();
+    if (!text || isEditing) return;
     setEditInstruction("");
-    setIsEditing(true);
+    setActionMode("none");
+    addMessage({ type: "user-text", text });
+    addMessage({ type: "bot-text", text: "Got it — weaving that into the next paragraph…" });
+    await injectEvent(text);
+  }, [editInstruction, isEditing, addMessage]);
 
-    addMessage({ type: "user-text", text: instruction });
-    addMessage({ type: "bot-text", text: "Let's recreate that story!" });
-    const progressId = addMessage({ type: "bot-progress", text: "Rewriting story…" });
+  // ── Action: Redirect story (persistent course change) ────
 
-    // Prime AudioContext NOW while we're still in the user gesture call stack.
-    // After awaits below we lose the gesture window and browsers may block resume().
+  const handleRedirect = useCallback(async () => {
+    const text = editInstruction.trim();
+    if (!text || isEditing) return;
+    setEditInstruction("");
+    setActionMode("none");
+    addMessage({ type: "user-text", text });
+    addMessage({ type: "bot-text", text: "Got it — changing course from here on…" });
+    await redirectStory(text);
+  }, [editInstruction, isEditing, addMessage]);
+
+  // ── Action: New fantasy (restart from scratch) ───────────
+
+  const handleNewFantasy = useCallback(async () => {
+    const text = editInstruction.trim();
+    if (!text || isEditing) return;
+    setEditInstruction("");
+    setActionMode("none");
+
+    // Prime AudioContext NOW while still in user gesture call stack
     chunkPlayerRef.current?.prime();
 
-    // If generation is still running, abort it first
+    addMessage({ type: "user-text", text });
+    const progressId = addMessage({ type: "bot-progress", text: "Stopping current story…" });
+
+    // Abort current generation and wait for it to fully release the lock
     if (generatingRef.current) {
-      updateMessage(progressId, "Stopping current generation…");
       await abortGeneration();
-      // Wait for the generate SSE stream to finish and set generatingRef = false
       const waitStart = Date.now();
-      while (generatingRef.current && Date.now() - waitStart < 5000) {
+      while (generatingRef.current && Date.now() - waitStart < 30000) {
         await new Promise((r) => setTimeout(r, 100));
       }
     }
 
-    // After abort, storyId should be set (the story event arrives before chunks).
-    // If it's still null, we can't edit.
-    if (!storyId) {
-      updateMessage(progressId, "No story to edit yet — try again after the story loads.");
-      setIsEditing(false);
-      return;
-    }
+    // Reset everything and restart with new fantasy
+    fantasyRef.current = text;
+    setStoryText(null);
+    setStoryId(null);
+    setAudioSrc(null);
 
-    // Get the current playback chunk index so we edit from where the user is listening
-    const fromChunk = chunkPlayerRef.current?.getCurrentChunkIndex() ?? undefined;
-    const fromChunkIndex = fromChunk != null && fromChunk >= 0 ? fromChunk + 1 : undefined;
+    // Kick off generation
+    setStage("generating");
+    updateMessage(progressId, "Starting new story…");
 
-    // Soft reset: clear queue and stop sources but keep AudioContext alive so new chunks
-    // can play (creating a new context in the async loop would be blocked by autoplay policy).
+    // Use resetForEdit (not reset) to keep the AudioContext alive —
+    // reset() closes the context, but prime() was called in the gesture
+    // call stack above and we can't re-prime after the awaits.
     chunkPlayerRef.current?.resetForEdit();
     setIsPlaying(false);
     isPlayingRef.current = false;
+    setAnalyserNode(null);
+    generatingRef.current = true;
 
     try {
-      for await (const event of streamEdit(storyId, instruction, fromChunkIndex)) {
+      for await (const event of streamGenerate(timeRef.current, text, voiceRef.current)) {
         if (event.type === "story") {
           setStoryText(event.text ?? null);
           setStoryId(event.story_id ?? null);
@@ -266,21 +286,41 @@ export default function App() {
             setAnalyserNode(node);
           }
         } else if (event.type === "done") {
-          updateMessage(progressId, "Story updated.");
+          updateMessage(progressId, "Story complete.");
+          setAudioSrc(`/api/audio?t=${Date.now()}`);
           setStage("done");
         } else if (event.type === "aborted") {
-          updateMessage(progressId, "Edit stopped.");
+          updateMessage(progressId, "Generation stopped.");
           setStage("done");
         } else if (event.type === "error") {
           updateMessage(progressId, `Error: ${event.text ?? "unknown"}`);
         }
       }
     } catch (err) {
-      updateMessage(progressId, `Couldn't update: ${String(err)}`);
+      updateMessage(progressId, `Error: ${String(err)}`);
     } finally {
-      setIsEditing(false);
+      generatingRef.current = false;
     }
-  }, [editInstruction, isEditing, storyId, stage, addMessage, updateMessage]);
+  }, [editInstruction, isEditing, addMessage, updateMessage]);
+
+  // ── Action: I'm done (stop generation) ───────────────────
+
+  const handleStop = useCallback(async () => {
+    setActionMode("none");
+    if (generatingRef.current) {
+      addMessage({ type: "user-text", text: "That's enough." });
+      addMessage({ type: "bot-text", text: "Wrapping up…" });
+      await abortGeneration();
+    }
+  }, [addMessage]);
+
+  // ── Submit handler routes to the active action mode ──────
+
+  const handleActionSubmit = useCallback(() => {
+    if (actionMode === "inject") handleInject();
+    else if (actionMode === "redirect") handleRedirect();
+    else if (actionMode === "new_fantasy") handleNewFantasy();
+  }, [actionMode, handleInject, handleRedirect, handleNewFantasy]);
 
   // ── Render ────────────────────────────────────────────────
 
@@ -357,25 +397,59 @@ export default function App() {
             )}
 
             {(stage === "generating" || stage === "done") && (
-              <div className="input-row">
-                <input
-                  className="text-input"
-                  value={editInstruction}
-                  onChange={(e) => setEditInstruction(e.target.value)}
-                  onKeyDown={(e) => e.key === "Enter" && handleEdit()}
-                  placeholder={
-                    isEditing
-                      ? "Updating story…"
-                      : stage === "generating"
-                        ? "Redirect the story… (stops current generation)"
-                        : "Change something… (e.g. 'make it darker')"
-                  }
-                  disabled={isEditing}
-                />
-                <button className="send-btn" onClick={handleEdit} disabled={isEditing}>
-                  {isEditing ? "…" : "Redirect"}
-                </button>
-              </div>
+              <>
+                {actionMode === "none" && !isEditing && (
+                  <div className="action-buttons">
+                    <button className="action-btn" onClick={() => setActionMode("new_fantasy")}>
+                      New fantasy
+                    </button>
+                    <button className="action-btn" onClick={() => setActionMode("inject")}>
+                      Add event
+                    </button>
+                    <button className="action-btn" onClick={() => setActionMode("redirect")}>
+                      Change course
+                    </button>
+                    <button className="action-btn action-btn--stop" onClick={handleStop}>
+                      I'm done
+                    </button>
+                  </div>
+                )}
+
+                {actionMode !== "none" && (
+                  <div className="input-row">
+                    <input
+                      className="text-input"
+                      value={editInstruction}
+                      onChange={(e) => setEditInstruction(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") handleActionSubmit();
+                        if (e.key === "Escape") { setActionMode("none"); setEditInstruction(""); }
+                      }}
+                      placeholder={
+                        actionMode === "inject"
+                          ? "What should happen next?"
+                          : actionMode === "redirect"
+                            ? "Where should the story go?"
+                            : "Describe your new fantasy…"
+                      }
+                      disabled={isEditing}
+                      autoFocus
+                    />
+                    <button className="send-btn" onClick={handleActionSubmit} disabled={isEditing}>
+                      {isEditing ? "…" : "Go"}
+                    </button>
+                    <button className="cancel-btn" onClick={() => { setActionMode("none"); setEditInstruction(""); }}>
+                      ✕
+                    </button>
+                  </div>
+                )}
+
+                {isEditing && actionMode === "none" && (
+                  <div className="input-row">
+                    <input className="text-input" disabled placeholder="Working on it…" />
+                  </div>
+                )}
+              </>
             )}
           </div>
         </div>
@@ -397,6 +471,9 @@ export default function App() {
             {audioSrc && (
               <div className="story-panel-audio">
                 <AudioPlayer src={audioSrc} />
+                <a className="download-btn" href="/api/audio" download="story.wav">
+                  Download
+                </a>
               </div>
             )}
 
