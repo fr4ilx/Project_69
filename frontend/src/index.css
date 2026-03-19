@@ -418,6 +418,121 @@ body {
   padding: 6px 0;
 }
 
+.mobile-story-btn {
+  display: none;
+  width: 100%;
+  background: #1e1e1e;
+  border: 1px solid #f472b6;
+  border-radius: 10px;
+  padding: 12px 14px;
+  color: #f472b6;
+  font-size: 0.92rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.mobile-story-modal {
+  display: none;
+}
+
+/* ── Mobile responsive ───────────────────────────────────── */
+
+@media (max-width: 640px) {
+  .app-body {
+    flex-direction: column;
+  }
+
+  .app-left {
+    width: 100%;
+    border-right: none;
+    height: 100%;
+    order: 0;
+  }
+
+  .app-right {
+    display: none;
+  }
+
+  /* Full-width action buttons on mobile */
+  .action-buttons {
+    flex-direction: column;
+  }
+
+  .action-btn {
+    width: 100%;
+    padding: 12px 18px;
+    text-align: center;
+  }
+
+  .input-row {
+    flex-wrap: nowrap;
+  }
+
+  .message.audio {
+    min-width: 0;
+    width: 100%;
+  }
+
+  .quick-reply-btn {
+    padding: 10px 16px;
+    font-size: 0.88rem;
+  }
+
+  .vibe-chip {
+    padding: 8px 14px;
+  }
+
+  .text-input {
+    font-size: 1rem; /* prevents iOS zoom on focus */
+  }
+
+  .story-panel-audio {
+    padding: 12px 14px;
+  }
+
+  .mobile-story-btn {
+    display: block;
+    margin-bottom: 10px;
+  }
+
+  .mobile-story-modal {
+    display: flex;
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.72);
+    z-index: 40;
+    align-items: flex-end;
+  }
+
+  .mobile-story-sheet {
+    width: 100%;
+    max-height: 80dvh;
+    overflow-y: auto;
+    background: #121212;
+    border-top-left-radius: 16px;
+    border-top-right-radius: 16px;
+    border-top: 1px solid #2a2a2a;
+    padding: 14px 14px 20px;
+  }
+
+  .mobile-story-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 10px;
+  }
+
+  .mobile-story-close {
+    background: transparent;
+    border: 1px solid #333;
+    border-radius: 8px;
+    color: #bbb;
+    padding: 6px 10px;
+    font-size: 0.82rem;
+    cursor: pointer;
+  }
+}
+
 /* ── Landing page ────────────────────────────────────────── */
 
 .landing {

@@ -12,14 +12,17 @@ import asyncio
 import json
 import os
 import re
-import shutil
+import time
 import uuid
 from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
@@ -33,11 +36,10 @@ import torchaudio as ta
 # App lifecycle — load TTS model once at startup
 # ---------------------------------------------------------------------------
 
-_model: story_tts.ChatterboxTurboTTS | None = None
-_lock = asyncio.Lock()
-_abort = asyncio.Event()  # set to signal current generation should stop
-_event_hint: str | None = None  # user-injected event for the next paragraph
-_redirect: str | None = None   # persistent course change for all remaining paragraphs
+_generation_models: list[story_tts.ChatterboxTurboTTS] = []
+_edit_lock = asyncio.Lock()
+_edit_abort = asyncio.Event()  # edit stream cancel signal
+_primary_model_lock = asyncio.Lock()  # serialize shared model-0 use with edit
 
 CHUNKS_DIR = Path("output_chunks")
 
@@ -73,19 +75,69 @@ def _new_story_record(
 _stories: dict[str, dict] = {}
 
 # State persisted between generate and edit calls
-_current_story: str = ""
-_chunks: list[str] = []
-_audio_parts: list[torch.Tensor] = []  # raw (pre-speed) per-chunk tensors
+@dataclass
+class GenerationJob:
+    time_str: str
+    fantasy: str
+    voice_name: str
+    stream: asyncio.Queue[dict[str, Any] | None] = field(default_factory=asyncio.Queue)
+    abort: asyncio.Event = field(default_factory=asyncio.Event)
+    event_hint: str | None = None
+    redirect: str | None = None
+    story_id: str | None = None
+    queued_at_monotonic: float = 0.0
+
+
+_MAX_CONCURRENT_JOBS = max(1, int(os.environ.get("MAX_CONCURRENT_JOBS", "1")))
+_job_queue: asyncio.Queue[GenerationJob | None] = asyncio.Queue()
+_worker_tasks: list[asyncio.Task] = []
+_active_jobs: dict[str, GenerationJob] = {}  # story_id -> job
+_worker_stats: list[dict[str, Any]] = []
+_jobs_enqueued_total = 0
+_jobs_completed_total = 0
+_jobs_failed_total = 0
+_jobs_aborted_total = 0
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _model
+    global _generation_models, _worker_stats
     db.init_db()
-    print("[Server] Loading TTS model…")
-    _model = await asyncio.to_thread(story_tts.load_tts_model)
-    print("[Server] TTS model ready.")
-    yield
+    print(f"[Server] Loading {_MAX_CONCURRENT_JOBS} TTS model instance(s)…")
+    _generation_models = []
+    for i in range(_MAX_CONCURRENT_JOBS):
+        print(f"[Server] Loading TTS model {i + 1}/{_MAX_CONCURRENT_JOBS}…")
+        model = await asyncio.to_thread(story_tts.load_tts_model)
+        _generation_models.append(model)
+    print("[Server] TTS model pool ready.")
+    CHUNKS_DIR.mkdir(parents=True, exist_ok=True)
+    _worker_stats = [
+        {
+            "worker_index": i,
+            "jobs_started": 0,
+            "jobs_completed": 0,
+            "jobs_failed": 0,
+            "jobs_aborted": 0,
+            "chunks_synthesized": 0,
+            "last_job_duration_ms": None,
+            "last_queue_wait_ms": None,
+            "last_error": None,
+            "active_story_id": None,
+        }
+        for i in range(_MAX_CONCURRENT_JOBS)
+    ]
+
+    for i, model in enumerate(_generation_models):
+        _worker_tasks.append(asyncio.create_task(_generation_worker(i, model)))
+    print(f"[Server] Generation worker pool ready (size={_MAX_CONCURRENT_JOBS}).")
+
+    try:
+        yield
+    finally:
+        for _ in _worker_tasks:
+            await _job_queue.put(None)
+        await asyncio.gather(*_worker_tasks, return_exceptions=True)
+        _worker_tasks.clear()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -107,115 +159,120 @@ _LONG_STORY_THRESHOLD = 2500  # words; above this use multi-segment generation
 _WORDS_PER_GROK_CHUNK = 100  # target words per Grok paragraph
 
 
-async def _sse_generator(time_str: str, fantasy: str, voice_name: str = "alyssa"):
-    """Async generator yielding SSE events for the full pipeline.
+async def _run_generation_job(job: GenerationJob, model: story_tts.ChatterboxTurboTTS, worker_index: int) -> None:
+    """Run one generation job and stream events to its queue.
 
-    Generates story paragraph by paragraph (chunk-by-chunk Grok calls),
-    synthesising each paragraph's TTS chunks immediately so playback starts fast.
-    Arc phase is read from the DB session each iteration — HR can update it live.
+    Each job owns its abort/event/redirect state so concurrent users do not interfere.
     """
-    target_words = _TIME_TO_WORDS.get(time_str.lower(), 950)
-    prompt = fantasy
+    target_words = _TIME_TO_WORDS.get(job.time_str.lower(), 950)
+    prompt = job.fantasy
     n_paragraphs = max(3, target_words // _WORDS_PER_GROK_CHUNK)
 
-    async with _lock:
-        # Clear abort INSIDE the lock — if we clear before acquiring,
-        # the old generator may miss the abort signal (same race as _sse_editor).
-        _abort.clear()
+    worker_stat = _worker_stats[worker_index]
+    started_at = time.monotonic()
+    worker_stat["jobs_started"] += 1
+    worker_stat["active_story_id"] = "pending_session"
+    if job.queued_at_monotonic > 0:
+        worker_stat["last_queue_wait_ms"] = int((started_at - job.queued_at_monotonic) * 1000)
 
-        global _redirect
-        _redirect = None  # clear any leftover redirect from a previous session
+    try:
+        story_id = uuid.uuid4().hex
+        job.story_id = story_id
+        worker_stat["active_story_id"] = story_id
 
-        try:
-            story_id = uuid.uuid4().hex
+        # Voice conditionals are worker-local (one model per worker).
+        voice_conds = story_tts.VOICES.get(job.voice_name)
+        if voice_conds is not None:
+            model.conds = voice_conds
 
-            # 1. Set voice
-            if voice_name in story_tts.VOICES:
-                _model.conds = story_tts.VOICES[voice_name]  # type: ignore[union-attr]
+        # 2. Create session chunk directory and register session
+        chunk_dir = CHUNKS_DIR / story_id
+        chunk_dir.mkdir(parents=True, exist_ok=True)
 
-            # 2. Create fresh chunk directory and register session
-            chunk_dir = CHUNKS_DIR / story_id
-            if CHUNKS_DIR.exists():
-                shutil.rmtree(CHUNKS_DIR)
-            chunk_dir.mkdir(parents=True)
+        db.create_session(story_id, prompt, job.voice_name)
+        _stories[story_id] = {
+            "story_id": story_id,
+            "story_text": "",
+            "voice": job.voice_name,
+            "status": "rendering",
+            "chunks": [],
+        }
+        _active_jobs[story_id] = job
+        record = _stories[story_id]
 
-            db.create_session(story_id, prompt, voice_name)
-            _stories[story_id] = {
-                "story_id": story_id,
-                "story_text": "",
-                "voice": voice_name,
-                "status": "rendering",
-                "chunks": [],
-            }
-            record = _stories[story_id]
+        await job.stream.put({"data": json.dumps({"type": "session", "story_id": story_id})})
 
-            yield {"data": json.dumps({"type": "session", "story_id": story_id})}
+        # 3. Generate paragraph by paragraph
+        audio_parts: list[torch.Tensor] = []
+        tts_index = 0
 
-            # 3. Generate paragraph by paragraph
-            audio_parts: list[torch.Tensor] = []
-            tts_index = 0  # global TTS chunk counter across all paragraphs
+        for para_i in range(n_paragraphs):
+            if job.abort.is_set():
+                record["status"] = "aborted"
+                await job.stream.put({"data": json.dumps({"type": "aborted", "chunks_completed": tts_index})})
+                return
 
-            for para_i in range(n_paragraphs):
-                if _abort.is_set():
+            is_first = para_i == 0
+            is_last = para_i == n_paragraphs - 1
+
+            arc_phase = story_tts.compute_arc_phase(para_i, n_paragraphs)
+            db.set_arc_phase(story_id, arc_phase)
+
+            await job.stream.put({"data": json.dumps({
+                "type": "progress",
+                "text": f"Writing paragraph {para_i + 1}/{n_paragraphs}…",
+            })})
+
+            # One-shot event hint + persistent redirect, both scoped to this job.
+            hint = job.event_hint
+            job.event_hint = None
+            combined_hint = " ".join(filter(None, [job.redirect, hint]))
+
+            story_so_far = db.get_story_so_far(story_id)
+            paragraph = await asyncio.to_thread(
+                story_tts.generate_next_chunk,
+                prompt,
+                story_so_far,
+                arc_phase,
+                is_first,
+                is_last,
+                _WORDS_PER_GROK_CHUNK,
+                combined_hint or None,
+            )
+
+            if job.abort.is_set():
+                record["status"] = "aborted"
+                await job.stream.put({"data": json.dumps({"type": "aborted", "chunks_completed": tts_index})})
+                return
+
+            record["story_text"] = (record["story_text"] + "\n\n" + paragraph).strip()
+            await job.stream.put({"data": json.dumps({"type": "story", "text": record["story_text"], "story_id": story_id})})
+
+            tts_chunks = story_tts.chunk_text(paragraph)
+            for tts_chunk in tts_chunks:
+                if job.abort.is_set():
                     record["status"] = "aborted"
-                    yield {"data": json.dumps({"type": "aborted", "chunks_completed": tts_index})}
+                    await job.stream.put({"data": json.dumps({"type": "aborted", "chunks_completed": tts_index})})
                     return
 
-                is_first = para_i == 0
-                is_last = para_i == n_paragraphs - 1
-
-                # Auto-advance arc phase based on position in the story
-                arc_phase = story_tts.compute_arc_phase(para_i, n_paragraphs)
-                db.set_arc_phase(story_id, arc_phase)
-
-                yield {"data": json.dumps({
+                await job.stream.put({"data": json.dumps({
                     "type": "progress",
-                    "text": f"Writing paragraph {para_i + 1}/{n_paragraphs}…",
-                })}
+                    "text": f"Synthesising chunk {tts_index + 1}…",
+                })})
 
-                # Consume any user-injected event hint (one-shot)
-                # and read persistent redirect (stays until new generation)
-                global _event_hint
-                hint = _event_hint
-                _event_hint = None
-                combined_hint = " ".join(filter(None, [_redirect, hint]))
-
-                story_so_far = db.get_story_so_far(story_id)
-                paragraph = await asyncio.to_thread(
-                    story_tts.generate_next_chunk,
-                    prompt,
-                    story_so_far,
-                    arc_phase,
-                    is_first,
-                    is_last,
-                    _WORDS_PER_GROK_CHUNK,
-                    combined_hint or None,
-                )
-
-                if _abort.is_set():
-                    record["status"] = "aborted"
-                    yield {"data": json.dumps({"type": "aborted", "chunks_completed": tts_index})}
-                    return
-
-                # Append paragraph to story text and emit update
-                record["story_text"] = (record["story_text"] + "\n\n" + paragraph).strip()
-                yield {"data": json.dumps({"type": "story", "text": record["story_text"], "story_id": story_id})}
-
-                # 4. Split paragraph into TTS-sized chunks and synthesise each
-                tts_chunks = story_tts.chunk_text(paragraph)
-                for tts_chunk in tts_chunks:
-                    if _abort.is_set():
-                        record["status"] = "aborted"
-                        yield {"data": json.dumps({"type": "aborted", "chunks_completed": tts_index})}
-                        return
-
-                    yield {"data": json.dumps({
-                        "type": "progress",
-                        "text": f"Synthesising chunk {tts_index + 1}…",
-                    })}
-
-                    wav: torch.Tensor = await asyncio.to_thread(
-                        _model.generate,  # type: ignore[union-attr]
+                if worker_index == 0:
+                    async with _primary_model_lock:
+                        wav: torch.Tensor = await asyncio.to_thread(
+                            model.generate,
+                            tts_chunk,
+                            temperature=story_tts.TTS_TEMPERATURE,
+                            repetition_penalty=story_tts.TTS_REP_PENALTY,
+                            top_p=story_tts.TTS_TOP_P,
+                            top_k=story_tts.TTS_TOP_K,
+                        )
+                else:
+                    wav = await asyncio.to_thread(
+                        model.generate,
                         tts_chunk,
                         temperature=story_tts.TTS_TEMPERATURE,
                         repetition_penalty=story_tts.TTS_REP_PENALTY,
@@ -223,50 +280,94 @@ async def _sse_generator(time_str: str, fantasy: str, voice_name: str = "alyssa"
                         top_k=story_tts.TTS_TOP_K,
                     )
 
-                    # Check abort right after TTS returns (may have been
-                    # set while the blocking generate call was running)
-                    if _abort.is_set():
-                        record["status"] = "aborted"
-                        yield {"data": json.dumps({"type": "aborted", "chunks_completed": tts_index})}
-                        return
+                if job.abort.is_set():
+                    record["status"] = "aborted"
+                    await job.stream.put({"data": json.dumps({"type": "aborted", "chunks_completed": tts_index})})
+                    return
 
-                    if wav.dim() == 1:
-                        wav = wav.unsqueeze(0)
-                    if story_tts.SPEECH_RATE != 1.0:
-                        wav = ta.functional.resample(
-                            wav,
-                            int(_model.sr * story_tts.SPEECH_RATE),  # type: ignore[union-attr]
-                            _model.sr,  # type: ignore[union-attr]
-                        )
+                if wav.dim() == 1:
+                    wav = wav.unsqueeze(0)
+                if story_tts.SPEECH_RATE != 1.0:
+                    wav = ta.functional.resample(
+                        wav,
+                        int(model.sr * story_tts.SPEECH_RATE),
+                        model.sr,
+                    )
 
-                    chunk_path = chunk_dir / f"chunk_{tts_index:03d}.wav"
-                    ta.save(str(chunk_path), wav, _model.sr)  # type: ignore[union-attr]
-                    audio_parts.append(wav)
+                chunk_path = chunk_dir / f"chunk_{tts_index:03d}.wav"
+                ta.save(str(chunk_path), wav, model.sr)
+                audio_parts.append(wav)
 
-                    record["chunks"].append({
-                        "index": tts_index,
-                        "text": tts_chunk,
-                        "status": "complete",
-                        "audio_path": str(chunk_path),
-                    })
-                    db.save_chunk(story_id, tts_index, tts_chunk, str(chunk_path))
+                record["chunks"].append({
+                    "index": tts_index,
+                    "text": tts_chunk,
+                    "status": "complete",
+                    "audio_path": str(chunk_path),
+                })
+                db.save_chunk(story_id, tts_index, tts_chunk, str(chunk_path))
 
-                    yield {"data": json.dumps({
-                        "type": "chunk",
-                        "index": tts_index,
-                        "url": f"/api/chunks/{story_id}/chunk_{tts_index:03d}.wav",
-                    })}
-                    tts_index += 1
+                await job.stream.put({"data": json.dumps({
+                    "type": "chunk",
+                    "index": tts_index,
+                    "url": f"/api/chunks/{story_id}/chunk_{tts_index:03d}.wav",
+                })})
+                worker_stat["chunks_synthesized"] += 1
+                tts_index += 1
 
-            # 5. Save combined output.wav
+        if audio_parts:
             combined = torch.cat(audio_parts, dim=-1)
-            ta.save(story_tts.OUTPUT_FILE, combined, _model.sr)  # type: ignore[union-attr]
+            ta.save(story_tts.OUTPUT_FILE, combined, model.sr)
 
-            record["status"] = "complete"
-            yield {"data": json.dumps({"type": "done"})}
+        record["status"] = "complete"
+        worker_stat["jobs_completed"] += 1
+        global _jobs_completed_total
+        _jobs_completed_total += 1
+        await job.stream.put({"data": json.dumps({"type": "done"})})
 
-        except Exception as exc:  # noqa: BLE001
-            yield {"data": json.dumps({"type": "error", "text": str(exc)})}
+    except Exception as exc:  # noqa: BLE001
+        worker_stat["jobs_failed"] += 1
+        worker_stat["last_error"] = str(exc)
+        global _jobs_failed_total
+        _jobs_failed_total += 1
+        await job.stream.put({"data": json.dumps({"type": "error", "text": str(exc)})})
+    finally:
+        elapsed_ms = int((time.monotonic() - started_at) * 1000)
+        worker_stat["last_job_duration_ms"] = elapsed_ms
+        worker_stat["active_story_id"] = None
+        if job.story_id:
+            record = _stories.get(job.story_id)
+            if record and record.get("status") == "aborted":
+                worker_stat["jobs_aborted"] += 1
+                global _jobs_aborted_total
+                _jobs_aborted_total += 1
+            _active_jobs.pop(job.story_id, None)
+        await job.stream.put(None)
+
+
+async def _generation_worker(worker_index: int, model: story_tts.ChatterboxTurboTTS) -> None:
+    while True:
+        job = await _job_queue.get()
+        if job is None:
+            _job_queue.task_done()
+            return
+        try:
+            await _run_generation_job(job, model, worker_index)
+        finally:
+            _job_queue.task_done()
+
+
+async def _stream_job(job: GenerationJob):
+    """SSE stream wrapper around queued generation jobs."""
+    global _jobs_enqueued_total
+    job.queued_at_monotonic = time.monotonic()
+    _jobs_enqueued_total += 1
+    await job.stream.put({"data": json.dumps({"type": "progress", "text": "Queued for generation…"})})
+    await _job_queue.put(job)
+    while True:
+        event = await job.stream.get()
+        if event is None:
+            return
+        yield event
 
 
 # ---------------------------------------------------------------------------
@@ -284,10 +385,10 @@ async def _sse_editor(story_id: str, instruction: str, from_chunk_index: int | N
         yield {"data": json.dumps({"type": "error", "text": "Story not found"})}
         return
 
-    async with _lock:
+    async with _edit_lock:
         # Clear abort only AFTER acquiring the lock — otherwise we race with
         # the generator and wipe the flag before it can see it.
-        _abort.clear()
+        _edit_abort.clear()
 
         try:
             chunks: list[str] = [c["text"] for c in record["chunks"]]
@@ -307,7 +408,7 @@ async def _sse_editor(story_id: str, instruction: str, from_chunk_index: int | N
                 instruction,
             )
 
-            if _abort.is_set():
+            if _edit_abort.is_set():
                 yield {"data": json.dumps({"type": "aborted"})}
                 return
 
@@ -353,14 +454,13 @@ async def _sse_editor(story_id: str, instruction: str, from_chunk_index: int | N
             chunk_dir = CHUNKS_DIR / new_story_id
             chunk_dir.mkdir(parents=True, exist_ok=True)
 
-            # 8. Set voice
             voice_name = record["voice"]
-            if voice_name in story_tts.VOICES:
-                _model.conds = story_tts.VOICES[voice_name]  # type: ignore[union-attr]
+            voice_conds = story_tts.VOICES.get(voice_name)
+            primary_model = _generation_models[0]
 
             # 9. Synthesise new chunks
             for i, chunk in enumerate(new_chunks, 1):
-                if _abort.is_set():
+                if _edit_abort.is_set():
                     new_record["status"] = "aborted"
                     yield {"data": json.dumps({"type": "aborted"})}
                     return
@@ -372,25 +472,28 @@ async def _sse_editor(story_id: str, instruction: str, from_chunk_index: int | N
                     "text": f"Re-synthesising chunk {i}/{new_n}…",
                 })}
 
-                wav: torch.Tensor = await asyncio.to_thread(
-                    _model.generate,  # type: ignore[union-attr]
-                    chunk,
-                    temperature=story_tts.TTS_TEMPERATURE,
-                    repetition_penalty=story_tts.TTS_REP_PENALTY,
-                    top_p=story_tts.TTS_TOP_P,
-                    top_k=story_tts.TTS_TOP_K,
-                )
+                async with _primary_model_lock:
+                    if voice_conds is not None:
+                        primary_model.conds = voice_conds
+                    wav: torch.Tensor = await asyncio.to_thread(
+                        primary_model.generate,
+                        chunk,
+                        temperature=story_tts.TTS_TEMPERATURE,
+                        repetition_penalty=story_tts.TTS_REP_PENALTY,
+                        top_p=story_tts.TTS_TOP_P,
+                        top_k=story_tts.TTS_TOP_K,
+                    )
                 if wav.dim() == 1:
                     wav = wav.unsqueeze(0)
                 if story_tts.SPEECH_RATE != 1.0:
                     wav = ta.functional.resample(
                         wav,
-                        int(_model.sr * story_tts.SPEECH_RATE),  # type: ignore[union-attr]
-                        _model.sr,  # type: ignore[union-attr]
+                        int(primary_model.sr * story_tts.SPEECH_RATE),
+                        primary_model.sr,
                     )
 
                 chunk_path = chunk_dir / f"chunk_{chunk_idx:03d}.wav"
-                ta.save(str(chunk_path), wav, _model.sr)  # type: ignore[union-attr]
+                ta.save(str(chunk_path), wav, primary_model.sr)
 
                 new_record["chunks"][split + i - 1]["status"] = "complete"
                 new_record["chunks"][split + i - 1]["audio_path"] = str(chunk_path)
@@ -426,6 +529,20 @@ class EditRequest(BaseModel):
 
 class InjectRequest(BaseModel):
     event: str
+    story_id: str | None = None
+
+
+class AbortRequest(BaseModel):
+    story_id: str | None = None
+
+
+def _resolve_target_job(story_id: str | None) -> GenerationJob | None:
+    if story_id:
+        return _active_jobs.get(story_id)
+    if not _active_jobs:
+        return None
+    # Fallback for legacy clients that do not send story_id.
+    return next(reversed(_active_jobs.values()))
 
 
 @app.get("/api/story/{story_id}")
@@ -444,32 +561,76 @@ async def voices():
     return {"voices": available if available else ["alyssa"]}
 
 
+@app.get("/api/metrics")
+async def metrics():
+    active_jobs: list[dict[str, Any]] = []
+    for sid, job in _active_jobs.items():
+        active_jobs.append(
+            {
+                "story_id": sid,
+                "voice": job.voice_name,
+                "queued_for_ms": int((time.monotonic() - job.queued_at_monotonic) * 1000)
+                if job.queued_at_monotonic > 0
+                else None,
+                "has_redirect": bool(job.redirect),
+                "has_event_hint": bool(job.event_hint),
+            }
+        )
+    return {
+        "config": {
+            "max_concurrent_jobs": _MAX_CONCURRENT_JOBS,
+            "loaded_models": len(_generation_models),
+        },
+        "queue": {
+            "depth": _job_queue.qsize(),
+            "active_jobs": len(_active_jobs),
+        },
+        "totals": {
+            "jobs_enqueued": _jobs_enqueued_total,
+            "jobs_completed": _jobs_completed_total,
+            "jobs_failed": _jobs_failed_total,
+            "jobs_aborted": _jobs_aborted_total,
+        },
+        "workers": _worker_stats,
+        "active": active_jobs,
+    }
+
+
 @app.post("/api/generate")
 async def generate(req: GenerateRequest):
-    return EventSourceResponse(_sse_generator(req.time, req.fantasy, req.voice))
+    return EventSourceResponse(_stream_job(GenerationJob(req.time, req.fantasy, req.voice)))
 
 
 @app.post("/api/abort")
-async def abort():
-    """Signal the current generation/edit to stop after the current chunk."""
-    _abort.set()
+async def abort(req: AbortRequest | None = None):
+    """Signal one generation/edit stream to stop after the current chunk."""
+    story_id = req.story_id if req else None
+    job = _resolve_target_job(story_id)
+    if job:
+        job.abort.set()
+        return {"ok": True, "story_id": job.story_id}
+    _edit_abort.set()
     return {"ok": True}
 
 
 @app.post("/api/inject")
 async def inject(req: InjectRequest):
     """Queue an event hint for the next generated paragraph."""
-    global _event_hint
-    _event_hint = req.event.strip() or None
-    return {"ok": True, "event": _event_hint}
+    job = _resolve_target_job(req.story_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="No active generation for story_id")
+    job.event_hint = req.event.strip() or None
+    return {"ok": True, "event": job.event_hint, "story_id": job.story_id}
 
 
 @app.post("/api/redirect")
 async def redirect(req: InjectRequest):
     """Set a persistent course change for all remaining paragraphs."""
-    global _redirect
-    _redirect = req.event.strip() or None
-    return {"ok": True, "redirect": _redirect}
+    job = _resolve_target_job(req.story_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="No active generation for story_id")
+    job.redirect = req.event.strip() or None
+    return {"ok": True, "redirect": job.redirect, "story_id": job.story_id}
 
 
 @app.post("/api/edit")
@@ -502,6 +663,15 @@ async def audio_chunk(story_id: str, filename: str):
     if not path.exists():
         raise HTTPException(status_code=404, detail="Chunk not found")
     return FileResponse(str(path), media_type="audio/wav")
+
+
+# ---------------------------------------------------------------------------
+# Serve built frontend (SPA) — must be mounted last so /api/* routes take priority
+# ---------------------------------------------------------------------------
+
+_FRONTEND_DIST = Path(__file__).parent / "frontend" / "dist"
+if _FRONTEND_DIST.exists():
+    app.mount("/", StaticFiles(directory=str(_FRONTEND_DIST), html=True), name="frontend")
 
 
 # ---------------------------------------------------------------------------

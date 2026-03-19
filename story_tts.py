@@ -115,6 +115,9 @@ VOICES_DIR = "voices"
 
 # In-memory cache of pre-baked voice conditionals, populated by load_voices()
 VOICES: dict[str, Conditionals] = {}
+VOICE_NAME_ALIASES: dict[str, str] = {
+    "audiomass-output": "jean",
+}
 
 # Test mode: set to a .md file path to skip Grok and read story from file instead
 # e.g. "test_story.md" — set to None to use Grok normally
@@ -544,10 +547,14 @@ def load_voices(model: ChatterboxTurboTTS) -> None:
         return
     device = model.device
     for pt in pts:
-        name = os.path.basename(pt).replace("_conds.pt", "")
+        raw_name = os.path.basename(pt).replace("_conds.pt", "")
+        name = VOICE_NAME_ALIASES.get(raw_name, raw_name)
         conds = Conditionals.load(pt, map_location=device).to(device)
         VOICES[name] = conds
-        print(f"[TTS] Loaded voice '{name}' from '{pt}'.")
+        if raw_name != name:
+            print(f"[TTS] Loaded voice '{raw_name}' as alias '{name}' from '{pt}'.")
+        else:
+            print(f"[TTS] Loaded voice '{name}' from '{pt}'.")
 
 
 def load_tts_model() -> ChatterboxTurboTTS:

@@ -12,7 +12,8 @@ Pipeline:
 ## Key files
 - `story_tts.py` — main pipeline (story gen + TTS)
 - `server.py` — FastAPI backend (SSE streaming, audio serving, chunk file serving)
-- `output_chunks/` — per-session WAV chunk files (`{story_id}/chunk_NNN.wav`); wiped on each new generation
+- `db.py` — SQLite persistence (sessions + chunks, `story.db`)
+- `output_chunks/` — per-session WAV chunk files (`{story_id}/chunk_NNN.wav`); no global wipe per generation
 - `frontend/` — Vite + React web UI
   - `src/App.tsx` — top-level state, split-screen layout
   - `src/components/ChatWindow.tsx` — left panel chat feed
@@ -110,9 +111,9 @@ Previously the server waited for all TTS chunks before sending any audio. Now:
 
 ### Server changes (`server.py`)
 - `CHUNKS_DIR = Path("output_chunks")` — root dir for per-session chunks
-- `_sse_generator` now generates a `story_id` (UUID hex), creates `output_chunks/{story_id}/`, saves each chunk wav after synthesis, emits `chunk` SSE event per chunk
-- `SPEECH_RATE` applied per-chunk (before saving) instead of on the combined file
-- `output_chunks/` is wiped at the start of each new generation (single-user; safe under `asyncio.Lock`)
+- Generator creates a `story_id` (UUID hex), writes `output_chunks/{story_id}/chunk_NNN.wav`, emits `chunk` SSE event per chunk
+- `SPEECH_RATE` applied per-chunk (before saving) instead of on combined file
+- No global `output_chunks/` wipe on each generation (multi-user safe)
 - New endpoint: `GET /api/chunks/{story_id}/{filename}` with path-traversal validation (story_id must be 32-char hex, filename must match `chunk_NNN.wav`)
 
 ### ChunkPlayer (`frontend/src/components/ChunkPlayer.tsx`)
@@ -141,6 +142,52 @@ Previously the server waited for all TTS chunks before sending any audio. Now:
 - `chunk` SSE events → `chunkPlayerRef.current.addChunk(event.url)`
 - `generatingRef` tracks whether the generate SSE stream is active (used by edit to know if abort is needed)
 
+## Arc pacing system (implemented 2026-03-11)
+
+### Problem solved
+Stories were stuck in "setup" mode — 8 paragraphs of atmosphere, 1 rushed climax. Root cause: `arc_phase` was read from DB but never updated, so every paragraph ran as `phase=setup`.
+
+### How it works
+- `compute_arc_phase(para_index, n_paragraphs)` in `story_tts.py` auto-calculates phase from paragraph position
+- Split: ~1/3 setup, 1 transitional "build" paragraph, ~1/2 peak (climax), ~1/6 finish
+- 4 arc directives in `_ARC_DIRECTIVES`: `setup`, `build`, `peak`, `finish`
+- Server calls `compute_arc_phase()` each iteration and updates DB via `db.set_arc_phase()`
+- System prompt also includes pacing instructions as a guardrail
+
+### Example for 10 paragraphs (5-min story)
+- Paragraphs 0–2: setup (3)
+- Paragraph 3: build (1)
+- Paragraphs 4–7: peak (4)
+- Paragraphs 8–9: finish (2)
+
+## Mid-session controls (implemented 2026-03-11)
+
+### 4 action buttons (replace old single edit input)
+During `generating` or `done` stages, user sees 4 buttons:
+
+1. **New fantasy** — abort current generation, prompt for new fantasy, restart from scratch
+   - Calls `POST /api/abort`, waits for lock release (up to 30s), then `POST /api/generate`
+   - Uses `resetForEdit()` (not `reset()`) to keep AudioContext alive after `prime()`
+2. **Add event** — one-shot hint for the next paragraph only
+   - Calls `POST /api/inject` with event text
+   - Server stores in `_event_hint`, consumed by next `generate_next_chunk()` call
+   - Does NOT interrupt playback — story continues, next paragraph weaves in the event
+3. **Change course** — persistent redirect for all remaining paragraphs
+   - Calls `POST /api/redirect` with redirect text
+   - Server stores in `_redirect`, applied to every remaining paragraph (not consumed)
+   - Cleared when a new generation starts
+4. **I'm done** — abort generation cleanly
+   - Calls `POST /api/abort`
+
+### Server endpoints
+- `POST /api/inject` — sets one-shot event hint for target story/job
+- `POST /api/redirect` — sets persistent redirect for target story/job
+- Both hints are combined and passed as `event_hint` to `generate_next_chunk()`
+
+### story_tts.py changes
+- `generate_next_chunk()` accepts `event_hint: str | None` parameter
+- Hint injected into Grok user message: "the listener has requested this happen…"
+
 ## Mid-session editing (implemented 2026-03-09)
 
 ### How it works
@@ -151,10 +198,8 @@ User can type a redirect instruction during generation OR after story completes.
 4. Kept chunk URLs are re-emitted so frontend can replay the full story (kept + new) seamlessly
 
 ### Server changes (`server.py`)
-- `_abort = asyncio.Event()` — set by `POST /api/abort`, checked before each chunk in generator and editor
-- `_abort.clear()` must happen INSIDE `async with _lock` (not before) to avoid race condition where editor clears the flag before generator sees it
-- `POST /api/abort` endpoint — sets the abort flag; generator/editor check it between chunks
-- `_sse_generator` checks `_abort.is_set()` after Grok returns and before each chunk synthesis; emits `{"type": "aborted"}` and releases lock early
+- `POST /api/abort` can target a specific story/job (`story_id`)
+- Generation abort is now per-job; editor has separate abort signal
 - `_sse_editor` accepts optional `from_chunk_index` (defaults to `n // 2`); emits kept chunk URLs before synthesising new chunks
 - `EditRequest` model has `from_chunk_index: int | None = None`
 
@@ -172,12 +217,49 @@ User can type a redirect instruction during generation OR after story completes.
 - `ChunkPlayer.reset()` before edit; kept chunks re-streamed by server for gapless replay
 
 ### API changes (`api.ts`)
-- `SSEEvent.type` includes `"aborted"`; new fields: `kept`, `chunks_completed`
+- `SSEEvent.type` includes `"session"` and `"aborted"`; fields: `story_id`, `kept`, `chunks_completed`
 - `streamEdit()` accepts optional `fromChunkIndex` parameter
-- `abortGeneration()` — `POST /api/abort`
+- `abortGeneration(storyId?)` — `POST /api/abort`
+- `injectEvent(event, storyId?)` — `POST /api/inject`
+- `redirectStory(event, storyId?)` — `POST /api/redirect`
 
-### Known race condition (fixed)
-`_abort.clear()` in `_sse_editor` was originally called BEFORE `async with _lock`, which raced with `_sse_generator` — the editor cleared the abort flag before the generator could see it, causing the generator to run all chunks to completion. Fix: moved `_abort.clear()` inside the lock.
+## Multi-user queue + worker pool (implemented 2026-03-19)
+
+### Problem solved
+Single global lock and shared mutable generation state blocked true multi-user usage and caused control collisions between sessions.
+
+### How it works now
+- Generation requests are enqueued as `GenerationJob` objects (`time`, `fantasy`, `voice`, per-job state/events)
+- SSE `POST /api/generate` now streams from a per-job queue
+- Worker pool size is configured by `MAX_CONCURRENT_JOBS` (default `1`)
+- Server preloads one `ChatterboxTurboTTS` model instance per worker
+- Each worker synthesises with its own model instance (parallel generation path)
+- Story controls are story-scoped: inject/redirect/abort target the active `story_id`
+- No global chunk-dir wipe; each story writes only to `output_chunks/{story_id}/`
+
+### Endpoints and events
+- `POST /api/generate` — returns SSE with early `session` event (`{type:"session", story_id}`)
+- `POST /api/abort` — optional `story_id` to abort one active story
+- `POST /api/inject` — optional `story_id`, one-shot next-paragraph hint
+- `POST /api/redirect` — optional `story_id`, persistent redirect for remaining paragraphs
+- `GET /api/metrics` — queue/worker runtime stats for tuning saturation
+
+### Metrics payload (`GET /api/metrics`)
+- `config`: `max_concurrent_jobs`, `loaded_models`
+- `queue`: queue depth and active job count
+- `totals`: jobs enqueued/completed/failed/aborted
+- `workers[]`: per-worker counters, last queue wait/job duration/error, active story
+- `active[]`: currently active stories and lightweight state
+
+### Tuning notes
+- Start with `MAX_CONCURRENT_JOBS=2` on 4090, then test `3`
+- Watch queue wait, worker job duration, and failures/OOM before increasing further
+
+## Audio download (implemented 2026-03-11)
+
+- `AudioPlayer` + download button shown in right panel bottom zone after generation completes
+- `audioSrc` set to `/api/audio?t={timestamp}` on "done" event (cache-busted)
+- Download link: `<a href="/api/audio" download="story.wav">`
 
 ## Decisions made
 - Switched from `ChatterboxTTS` to `ChatterboxTurboTTS` (faster, GitHub-only release)

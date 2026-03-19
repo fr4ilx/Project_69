@@ -24,6 +24,18 @@ export interface Message {
 // ---------------------------------------------------------------------------
 
 const TIME_OPTIONS = ["5 minutes", "15 minutes", "30 minutes", "An hour"];
+const VOICE_LABEL_OVERRIDES: Record<string, string> = {
+  jean: "Jean",
+};
+
+function toVoiceLabel(voice: string): string {
+  if (VOICE_LABEL_OVERRIDES[voice]) return VOICE_LABEL_OVERRIDES[voice];
+  return voice
+    .split(/[-_]/g)
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
+}
 
 const VIBE_CHIPS = [
   {
@@ -89,6 +101,7 @@ export default function App() {
   const [actionMode, setActionMode] = useState<"none" | "inject" | "redirect" | "new_fantasy">("none");
   const [storyText, setStoryText] = useState<string | null>(null);
   const [storyId, setStoryId] = useState<string | null>(null);
+  const [isStoryOpen, setIsStoryOpen] = useState(false);
   const [audioSrc, setAudioSrc] = useState<string | null>(null); // used for post-edit replay
   const [analyserNode, setAnalyserNode] = useState<AnalyserNode | null>(null);
   const [isPlaying, setIsPlaying] = useState(false); // true once first chunk arrives
@@ -172,7 +185,9 @@ export default function App() {
 
     try {
       for await (const event of streamGenerate(timeRef.current, fantasyRef.current, voiceRef.current)) {
-        if (event.type === "story") {
+        if (event.type === "session") {
+          setStoryId(event.story_id ?? null);
+        } else if (event.type === "story") {
           setStoryText(event.text ?? null);
           setStoryId(event.story_id ?? null);
         } else if (event.type === "progress") {
@@ -213,8 +228,8 @@ export default function App() {
     setActionMode("none");
     addMessage({ type: "user-text", text });
     addMessage({ type: "bot-text", text: "Got it — weaving that into the next paragraph…" });
-    await injectEvent(text);
-  }, [editInstruction, isEditing, addMessage]);
+    await injectEvent(text, storyId);
+  }, [editInstruction, isEditing, addMessage, storyId]);
 
   // ── Action: Redirect story (persistent course change) ────
 
@@ -225,8 +240,8 @@ export default function App() {
     setActionMode("none");
     addMessage({ type: "user-text", text });
     addMessage({ type: "bot-text", text: "Got it — changing course from here on…" });
-    await redirectStory(text);
-  }, [editInstruction, isEditing, addMessage]);
+    await redirectStory(text, storyId);
+  }, [editInstruction, isEditing, addMessage, storyId]);
 
   // ── Action: New fantasy (restart from scratch) ───────────
 
@@ -244,7 +259,7 @@ export default function App() {
 
     // Abort current generation and wait for it to fully release the lock
     if (generatingRef.current) {
-      await abortGeneration();
+      await abortGeneration(storyId);
       const waitStart = Date.now();
       while (generatingRef.current && Date.now() - waitStart < 30000) {
         await new Promise((r) => setTimeout(r, 100));
@@ -272,7 +287,9 @@ export default function App() {
 
     try {
       for await (const event of streamGenerate(timeRef.current, text, voiceRef.current)) {
-        if (event.type === "story") {
+        if (event.type === "session") {
+          setStoryId(event.story_id ?? null);
+        } else if (event.type === "story") {
           setStoryText(event.text ?? null);
           setStoryId(event.story_id ?? null);
         } else if (event.type === "progress") {
@@ -301,7 +318,7 @@ export default function App() {
     } finally {
       generatingRef.current = false;
     }
-  }, [editInstruction, isEditing, addMessage, updateMessage]);
+  }, [editInstruction, isEditing, addMessage, updateMessage, storyId]);
 
   // ── Action: I'm done (stop generation) ───────────────────
 
@@ -310,9 +327,9 @@ export default function App() {
     if (generatingRef.current) {
       addMessage({ type: "user-text", text: "That's enough." });
       addMessage({ type: "bot-text", text: "Wrapping up…" });
-      await abortGeneration();
+      await abortGeneration(storyId);
     }
-  }, [addMessage]);
+  }, [addMessage, storyId]);
 
   // ── Submit handler routes to the active action mode ──────
 
@@ -391,13 +408,21 @@ export default function App() {
 
             {stage === "voice" && (
               <QuickReplies
-                options={availableVoices.length ? availableVoices.map((v) => v.charAt(0).toUpperCase() + v.slice(1)) : ["Alyssa"]}
-                onSelect={(v) => handleVoiceSelect(v.toLowerCase())}
+                options={availableVoices.length ? availableVoices.map(toVoiceLabel) : ["Alyssa"]}
+                onSelect={(label) => {
+                  const selected = availableVoices.find((v) => toVoiceLabel(v) === label);
+                  handleVoiceSelect(selected ?? label.toLowerCase());
+                }}
               />
             )}
 
             {(stage === "generating" || stage === "done") && (
               <>
+                {storyText && (
+                  <button className="mobile-story-btn" onClick={() => setIsStoryOpen(true)}>
+                    View Story here
+                  </button>
+                )}
                 {actionMode === "none" && !isEditing && (
                   <div className="action-buttons">
                     <button className="action-btn" onClick={() => setActionMode("new_fantasy")}>
@@ -490,6 +515,30 @@ export default function App() {
           </div>
         </div>
       </div>
+
+      {isStoryOpen && (
+        <div className="mobile-story-modal" onClick={() => setIsStoryOpen(false)}>
+          <div className="mobile-story-sheet" onClick={(e) => e.stopPropagation()}>
+            <div className="mobile-story-header">
+              <p className="story-panel-label">Your Story</p>
+              <button className="mobile-story-close" onClick={() => setIsStoryOpen(false)}>
+                Close
+              </button>
+            </div>
+            {audioSrc && (
+              <div className="story-panel-audio">
+                <AudioPlayer src={audioSrc} />
+                <a className="download-btn" href="/api/audio" download="story.wav">
+                  Download
+                </a>
+              </div>
+            )}
+            <div className="story-panel">
+              <div className="story-panel-body">{storyText}</div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

@@ -1,5 +1,5 @@
 export interface SSEEvent {
-  type: "story" | "progress" | "chunk" | "done" | "error" | "aborted";
+  type: "session" | "story" | "progress" | "chunk" | "done" | "error" | "aborted";
   text?: string;
   story_id?: string; // present when type === "story"
   url?: string;      // present when type === "chunk"
@@ -62,29 +62,33 @@ export async function fetchVoices(): Promise<string[]> {
 /**
  * Signal the server to abort the current generation/edit after the current chunk.
  */
-export async function abortGeneration(): Promise<void> {
-  await fetch("/api/abort", { method: "POST" });
+export async function abortGeneration(storyId?: string | null): Promise<void> {
+  await fetch("/api/abort", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(storyId ? { story_id: storyId } : {}),
+  });
 }
 
 /**
  * Queue an event hint to be woven into the next generated paragraph.
  */
-export async function injectEvent(event: string): Promise<void> {
+export async function injectEvent(event: string, storyId?: string | null): Promise<void> {
   await fetch("/api/inject", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ event }),
+    body: JSON.stringify(storyId ? { event, story_id: storyId } : { event }),
   });
 }
 
 /**
  * Set a persistent course change for all remaining paragraphs.
  */
-export async function redirectStory(event: string): Promise<void> {
+export async function redirectStory(event: string, storyId?: string | null): Promise<void> {
   await fetch("/api/redirect", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ event }),
+    body: JSON.stringify(storyId ? { event, story_id: storyId } : { event }),
   });
 }
 
